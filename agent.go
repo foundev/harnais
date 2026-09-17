@@ -27,6 +27,7 @@ func systemPrompt(extra string) string {
 	sb.WriteString("You have exactly four tools: bash (run shell commands), read (read files), edit (exact unique-match file edit), write (create/overwrite files).\n")
 	sb.WriteString("Guidelines: read a file before editing it; prefer edit over write for existing files; make the smallest change that solves the task; verify work by running the project's own build, tests, or checks; keep final answers short and state which files changed and which commands you ran.\n")
 	sb.WriteString("Do not claim an action succeeded without tool output proving it. Do not run interactive or long-running foreground commands.\n")
+	sb.WriteString("bash runs sandboxed (no network, writes confined to the work directory); the reviewer may let a single call run outside the sandbox when it genuinely needs network or outside files — a sandbox denial names this, so retry the call rather than working around it.\n")
 	fmt.Fprintf(&sb, "Working directory: %s\n", cwd)
 	if strings.TrimSpace(extra) != "" {
 		sb.WriteString("Additional instructions:\n" + strings.TrimSpace(extra) + "\n")
@@ -83,6 +84,7 @@ func runPrompt(ctx context.Context, sender messageSender, cfg config, history []
 					continue
 				}
 			}
+			escalated := false
 			summary := summarizeInput(block.Name, input)
 			call := paint(ansiCyan, fmt.Sprintf("● %s(%s)", block.Name, summary))
 			if block.Name == "bash" && !cfg.sandbox {
@@ -90,7 +92,7 @@ func runPrompt(ctx context.Context, sender messageSender, cfg config, history []
 			}
 			report("%s", call)
 			if isMutating(block.Name) {
-				approved, rationale, rerr := reviewToolCall(ctx, sender, cfg, history, block.Name, input)
+				approved, esc, rationale, rerr := reviewToolCall(ctx, sender, cfg, history, block.Name, input)
 				if rerr != nil {
 					return "", history, rerr
 				}
@@ -108,13 +110,16 @@ func runPrompt(ctx context.Context, sender messageSender, cfg config, history []
 					}
 					continue
 				}
-				if rationale == "" {
+				escalated = esc
+				if escalated && block.Name == "bash" && cfg.sandbox {
+					report("%s", paint(ansiYellow, "  review: approved, escalated outside the sandbox"))
+				} else if rationale == "" {
 					report("  review: approved")
 				} else {
 					report("  review: approved — %s", firstLine(rationale))
 				}
 			}
-			out, err := executeToolSandboxed(ctx, block.Name, input, cfg.sandbox)
+			out, err := executeToolSandboxed(ctx, block.Name, input, sandboxForCall(cfg.sandbox, block.Name, escalated))
 			consecutiveDenials = 0
 			if err != nil {
 				if out == "" {

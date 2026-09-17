@@ -181,7 +181,7 @@ func runBash(ctx context.Context, input map[string]any, sandbox bool) (string, e
 	// say what actually happened and name the escape hatch.
 	hint := ""
 	if sandboxed {
-		hint = "\n(sandboxed: denied by the OS sandbox — rerun harnais with --no-sandbox if this needs network or files outside the workdir)"
+		hint = "\n(sandboxed: denied by the OS sandbox — retry the call so the reviewer can approve it outside the sandbox if it genuinely needs network or files outside the workdir)"
 	}
 	if ctx.Err() == context.DeadlineExceeded {
 		return fmt.Sprintf("timeout after %v\n--- output ---\n%s%s", elapsed.Round(time.Millisecond), out, hint),

@@ -158,6 +158,66 @@ func TestReviewerApprovesRunsTheCall(t *testing.T) {
 	}
 }
 
+// TestReviewerEscalationLiftsSandbox verifies APPROVE UNSANDBOXED runs one
+// bash call outside the OS sandbox. runBash marks sandboxed runs with
+// HARNAIS_SANDBOX=1, so `printenv` distinguishes: sandboxed prints 1,
+// escalated prints nothing. (On platforms without sandbox-exec every run
+// is unsandboxed, so the output assertion is vacuous there and the
+// progress-line assertion carries the wiring check.)
+func TestReviewerEscalationLiftsSandbox(t *testing.T) {
+	sender := &fakeSender{t: t}
+	sender.script = func(call int, req messageRequest) messageResponse {
+		if len(req.Tools) == 0 {
+			return reviewVerdictResponse("APPROVE UNSANDBOXED: test needs the real environment")
+		}
+		return proposeEcho(t, "printenv HARNAIS_SANDBOX", "escalated it")(call, req)
+	}
+
+	var reports []string
+	report := func(format string, args ...any) {
+		reports = append(reports, fmt.Sprintf(format, args...))
+	}
+	cfg := config{model: "test-model", maxTokens: 128, maxIters: 5, sandbox: true}
+	answer, history, err := runPrompt(context.Background(), sender, cfg, nil, "hi", report)
+	if err != nil {
+		t.Fatalf("runPrompt: %v", err)
+	}
+	if answer != "escalated it" {
+		t.Fatalf("unexpected answer: %q", answer)
+	}
+	found := false
+	for _, r := range reports {
+		if strings.Contains(r, "escalated outside the sandbox") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("escalation was not reported: %q", reports)
+	}
+	sawResult := false
+	for _, msg := range history {
+		var blocks []contentBlock
+		if err := json.Unmarshal(msg.Content, &blocks); err != nil {
+			continue
+		}
+		for _, b := range blocks {
+			if b.Type != "tool_result" {
+				continue
+			}
+			sawResult = true
+			// Escalated, the marker var is absent so printenv finds
+			// nothing; sandboxed, it prints 1 — or fails with the
+			// sandbox hint where nested sandboxing is denied.
+			if !strings.Contains(b.Content, "(no output)") || strings.Contains(b.Content, "sandboxed: denied") {
+				t.Errorf("escalated call still ran sandboxed, output:\n%s", b.Content)
+			}
+		}
+	}
+	if !sawResult {
+		t.Error("no tool result in history")
+	}
+}
+
 // TestReviewerDeniesBlocksExecution verifies a denied call never runs and
 // the rationale reaches the model with a safer-path instruction.
 func TestReviewerDeniesBlocksExecution(t *testing.T) {
@@ -233,25 +293,98 @@ func TestReviewerUnavailableAbortsTurn(t *testing.T) {
 
 func TestReviewVerdictParse(t *testing.T) {
 	for _, tc := range []struct {
-		in       string
-		approved bool
-		want     string
+		in        string
+		approved  bool
+		escalated bool
+		want      string
 	}{
-		{"APPROVE: safe", true, "safe"},
-		{"approve looks fine", true, "looks fine"},
-		{"APPROVE", true, ""},
-		{"DENY: destructive", false, "destructive"},
-		{"deny - risky", false, "risky"},
-		{"DENY", false, ""},
-		{"APPROVEDLY", false, "no clear verdict"},
-		{"maybe later", false, "no clear verdict"},
-		{"", false, "no clear verdict"},
+		{"APPROVE: safe", true, false, "safe"},
+		{"approve looks fine", true, false, "looks fine"},
+		{"APPROVE", true, false, ""},
+		{"APPROVE UNSANDBOXED: needs network", true, true, "needs network"},
+		{"approve unsandboxed fetch a module", true, true, "fetch a module"},
+		{"APPROVE-UNSANDBOXED: outside files", true, true, "outside files"},
+		{"APPROVE UNSANDBOXED", true, true, ""},
+		{"DENY: destructive", false, false, "destructive"},
+		{"deny - risky", false, false, "risky"},
+		{"DENY", false, false, ""},
+		{"APPROVEDLY", false, false, "no clear verdict"},
+		{"APPROVE UNSANDBOXEDLY: typo", false, false, "no clear verdict"},
+		{"maybe later", false, false, "no clear verdict"},
+		{"", false, false, "no clear verdict"},
 	} {
-		approved, rationale := reviewVerdict(tc.in)
-		if approved != tc.approved || !strings.Contains(rationale, tc.want) {
-			t.Errorf("reviewVerdict(%q) = (%v, %q), want (%v, containing %q)",
-				tc.in, approved, rationale, tc.approved, tc.want)
+		approved, escalated, rationale := reviewVerdict(tc.in)
+		if approved != tc.approved || escalated != tc.escalated || !strings.Contains(rationale, tc.want) {
+			t.Errorf("reviewVerdict(%q) = (%v, %v, %q), want (%v, %v, containing %q)",
+				tc.in, approved, escalated, rationale, tc.approved, tc.escalated, tc.want)
 		}
+	}
+}
+
+func TestSandboxForCall(t *testing.T) {
+	for _, tc := range []struct {
+		sandbox, escalated bool
+		tool               string
+		want               bool
+	}{
+		{true, false, "bash", true},
+		{true, true, "bash", false},
+		{false, true, "bash", false},
+		{false, false, "bash", false},
+		// Escalation is meaningless off bash: read/edit/write never run
+		// under sandbox-exec, so the flag is ignored, never widening.
+		{true, true, "edit", true},
+		{true, true, "write", true},
+		{true, true, "read", true},
+	} {
+		if got := sandboxForCall(tc.sandbox, tc.tool, tc.escalated); got != tc.want {
+			t.Errorf("sandboxForCall(%v, %q, %v) = %v, want %v",
+				tc.sandbox, tc.tool, tc.escalated, got, tc.want)
+		}
+	}
+}
+
+func TestReviewGoal(t *testing.T) {
+	history := []message{
+		textMessage("user", "fix the typo on the homepage"),
+		blocksMessage("assistant", []contentBlock{{Type: "text", Text: "on it"}}),
+		blocksMessage("user", []contentBlock{
+			{Type: "tool_result", ToolUseID: "c1", Content: "some output"},
+		}),
+		textMessage("user", "also update the footer"),
+	}
+	if got := reviewGoal(history); got != "fix the typo on the homepage" {
+		t.Errorf("goal must be the first user text, got %q", got)
+	}
+	if got := reviewGoal(nil); got != "(none stated)" {
+		t.Errorf("empty history needs a fallback, got %q", got)
+	}
+	long := []message{textMessage("user", strings.Repeat("y", reviewTranscriptChars+10))}
+	if got := reviewGoal(long); len(got) > reviewTranscriptChars+10 {
+		t.Errorf("goal must stay compact: %d bytes", len(got))
+	}
+}
+
+// TestReviewSeesOriginalTask verifies the reviewer request pins the session
+// goal even after tool traffic pushes it out of the transcript window.
+func TestReviewSeesOriginalTask(t *testing.T) {
+	history := []message{textMessage("user", "migrate the database")}
+	for i := 0; i < reviewTranscriptMessages+2; i++ {
+		history = append(history, textMessage("user", fmt.Sprintf("filler %d", i)))
+	}
+	sender := &fakeSender{t: t}
+	sender.script = func(call int, req messageRequest) messageResponse {
+		return reviewVerdictResponse("APPROVE: on task")
+	}
+	cfg := config{model: "test-model", maxTokens: 128}
+	approved, _, _, err := reviewToolCall(context.Background(), sender, cfg, history,
+		"bash", map[string]any{"command": "echo hi"})
+	if err != nil || !approved {
+		t.Fatalf("reviewToolCall = (%v, %v), want approval", approved, err)
+	}
+	blob := requestJSON(t, sender.requests[0])
+	if !strings.Contains(blob, "Original task: migrate the database") {
+		t.Errorf("review request must pin the session goal:\n%s", blob)
 	}
 }
 

@@ -144,12 +144,16 @@ There are no human confirmation prompts. Instead, every mutating tool call
 (`bash`, `edit`, `write`; `read` runs free) goes to a separate reviewer
 pass over the same backend before it runs — the same idea as [Codex
 auto-review](https://learn.chatgpt.com/docs/sandboxing/auto-review),
-without its policy config. The reviewer sees a compact transcript plus the
-exact proposed action and answers `APPROVE`/`DENY` with a rationale; a
+without its policy config. The reviewer sees the session's original task
+plus a compact transcript and the exact proposed action, and answers
+`APPROVE`/`DENY` with a rationale; a
 denial returns the rationale with instructions to find a materially safer
 path, and three denials in a row abort the turn. Each review costs extra
-model calls on your backend. The OS sandbox (above) still confines every
-`bash` call underneath all of this.
+model calls on your backend. When a `bash` call is otherwise safe but
+genuinely needs network access or files outside the work directory, the
+reviewer can answer `APPROVE UNSANDBOXED` to run that one call outside the
+OS sandbox; anything else stays confined, and the agent itself can never
+request the escalation — only the reviewer pass grants it.
 
 Tool progress, including `review: approved/denied` lines, goes to stderr,
 so `harnais "prompt" > answer.txt` captures just the final answer.
@@ -169,11 +173,14 @@ so `harnais "prompt" > answer.txt` captures just the final answer.
 [Codex's sandbox](https://github.com/openai/codex/tree/main/codex-rs/sandboxing)):
 deny-by-default, writes confined to the command workdir plus standard
 temp/cache locations, no network. Reads stay open and `read`/`edit`/`write`
-are unaffected (path-confined and still confirmed). The agent cannot switch
-sandboxing off per-call — only the `--no-sandbox` process flag escapes, so
+are unaffected (and already run as the process user). The agent cannot switch
+sandboxing off per-call — only the `--no-sandbox` process flag or a
+reviewer `APPROVE UNSANDBOXED` verdict escapes for one call, so
 prompt injection can't break out that way. Unsandboxed runs are marked
-`[no sandbox]` in the progress output, and sandbox denials name the escape
-hatch. Other platforms currently run unsandboxed with a one-time warning
+`[no sandbox]` in the progress output, escalated ones report
+`review: approved, escalated outside the sandbox`, and sandbox denials tell
+the model to retry for reviewer escalation. Other platforms currently run
+unsandboxed with a one-time warning
 (Linux confinement is the follow-up).
 
 ## Layout
