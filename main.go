@@ -79,17 +79,17 @@ In a session, type /help for slash commands (/provider, /model, /effort, /reset,
 	// first run); -provider overrides it for one run without saving.
 	cfgPath, err := configFilePath()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "harnais: %v (provider choice will not persist)\n", err)
+		fmt.Fprintf(os.Stderr, "harnais: %s\n", paint(ansiYellow, fmt.Sprintf("%v (provider choice will not persist)", err)))
 		cfgPath = ""
 	}
 	stored, werr := loadStoredConfig(cfgPath)
 	if werr != nil {
-		fmt.Fprintf(os.Stderr, "harnais: %v, using defaults\n", werr)
+		fmt.Fprintf(os.Stderr, "harnais: %s\n", paint(ansiYellow, fmt.Sprintf("%v, using defaults", werr)))
 	}
 	provider := firstNonEmpty(*providerFlag, stored.Provider)
 	defModel, err := defaultModelFor(provider)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "harnais: %v\n", err)
+		printErr("%v", err)
 		return 2
 	}
 	cfg := config{
@@ -110,7 +110,7 @@ In a session, type /help for slash commands (/provider, /model, /effort, /reset,
 		if cfg.skipConfirm {
 			return true
 		}
-		fmt.Fprintf(os.Stderr, "run %s(%s)? [y/N] ", tool, summary)
+		fmt.Fprintf(os.Stderr, "%s", paint(ansiYellow, fmt.Sprintf("run %s(%s)? [y/N] ", tool, summary)))
 		line, err := in.ReadString('\n')
 		if err != nil {
 			return false
@@ -128,22 +128,22 @@ In a session, type /help for slash commands (/provider, /model, /effort, /reset,
 
 	prompt, err := resolvePrompt(*printMode, fs.Args())
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "harnais: %v\n", err)
+		printErr("%v", err)
 		return 2
 	}
 	if prompt != "" {
 		// One-shot mode cannot switch later, so its credential is due now.
 		sender, err := buildSender(provider, *apiKey)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "harnais: %v\n", err)
+			printErr("%v", err)
 			return 2
 		}
 		answer, _, err := runPrompt(ctx, sender, cfg, nil, prompt, confirm, report)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "harnais: %v\n", err)
+			printErr("%v", err)
 			return 1
 		}
-		fmt.Println(answer)
+		fmt.Println(paintAnswer(answer))
 		return 0
 	}
 	// Sessions start without touching any credential: the backend is built
@@ -303,10 +303,10 @@ func describeEffort(sess *session) string {
 func persistSession(sess *session, report progressFunc, what string) {
 	sc := storedConfig{Provider: sess.provider, Model: sess.cfg.model, Effort: sess.cfg.effort}
 	if err := saveStoredConfig(sess.configPath, sc); err != nil {
-		report("%s (default not saved: %v)", what, err)
+		report("%s", paint(ansiYellow, fmt.Sprintf("%s (default not saved: %v)", what, err)))
 		return
 	}
-	report("%s (saved as default)", what)
+	report("%s", paint(ansiGreen, fmt.Sprintf("%s (saved as default)", what)))
 }
 
 // handleSlash runs one REPL slash command. It returns handled=true for any
@@ -336,7 +336,7 @@ func handleSlash(sess *session, line string, report progressFunc) (handled, exit
 		}
 		sender, model, err := resolveBackend(fields[1], "", "")
 		if err != nil {
-			report("cannot switch: %v", err)
+			report("%s", paint(ansiRed, fmt.Sprintf("cannot switch: %v", err)))
 			break
 		}
 		sess.sender = sender
@@ -362,13 +362,13 @@ func handleSlash(sess *session, line string, report progressFunc) (handled, exit
 			break
 		}
 		if !validEffort(fields[1]) {
-			report("effort must be low, medium, high, or default")
+			report("%s", paint(ansiRed, "effort must be low, medium, high, or default"))
 			break
 		}
 		sess.cfg.effort = fields[1]
 		persistSession(sess, report, fmt.Sprintf("effort: %s (sent to %s backends only)", sess.cfg.effort, effortBackends))
 	default:
-		report("unknown command %q — type /help", fields[0])
+		report("%s", paint(ansiRed, fmt.Sprintf("unknown command %q — type /help", fields[0])))
 	}
 	return true, false
 }
@@ -459,9 +459,9 @@ func firstNonEmpty(vals ...string) string {
 }
 
 func repl(ctx context.Context, sess *session, in *bufio.Reader, confirm confirmFunc, report progressFunc) int {
-	report("harnais %s — %s/%s (type /help for commands)", version, sess.provider, sess.cfg.model)
+	report("harnais %s — %s (type /help for commands)", version, paint(ansiCyan, sess.provider+"/"+sess.cfg.model))
 	for {
-		fmt.Fprintf(os.Stderr, "%s> ", sess.provider)
+		fmt.Fprintf(os.Stderr, "%s", paint(ansiBoldCyan, sess.provider+"> "))
 		line, err := in.ReadString('\n')
 		if err != nil {
 			fmt.Fprintln(os.Stderr)
@@ -478,17 +478,22 @@ func repl(ctx context.Context, sess *session, in *bufio.Reader, confirm confirmF
 			continue
 		}
 		if err := ensureSender(sess); err != nil {
-			fmt.Fprintf(os.Stderr, "harnais: %v\n", err)
+			printErr("%v", err)
 			continue
 		}
 		answer, updated, err := runPrompt(ctx, sess.sender, sess.cfg, sess.history, prompt, confirm, report)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "harnais: %v\n", err)
+			printErr("%v", err)
 			continue
 		}
 		sess.history = updated
-		fmt.Println(answer)
+		fmt.Println(paintAnswer(answer))
 	}
+}
+
+// printErr reports a failure in red (TTY only, see color.go).
+func printErr(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, "harnais: %s\n", paint(ansiRed, fmt.Sprintf(format, args...)))
 }
 
 func envOr(key, def string) string {

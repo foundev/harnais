@@ -69,7 +69,9 @@ harnais -provider=codex "explain what main.go does"
 
 Start an interactive session (history is kept until `/reset` or `/exit`).
 The prompt shows the active backend, with a spinner on stderr while the
-model thinks:
+model thinks. Prompts, progress, and errors are colored on terminals
+(`NO_COLOR` disables it); model answers render as highlighted markdown on
+terminals and stay plain when piped:
 
 ```sh
 harnais

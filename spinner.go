@@ -56,7 +56,7 @@ func (s *spinner) run(w io.Writer, label string) {
 			fmt.Fprint(w, "\r\033[K")
 			return
 		case <-tick.C:
-			fmt.Fprintf(w, "\r%s %s (%.0fs)", spinnerFrames[i%len(spinnerFrames)], label, time.Since(start).Seconds())
+			fmt.Fprintf(w, "\r%s %s (%.0fs)", paint(ansiCyan, spinnerFrames[i%len(spinnerFrames)]), label, time.Since(start).Seconds())
 			i++
 		}
 	}

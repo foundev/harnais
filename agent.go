@@ -85,14 +85,14 @@ func runPrompt(ctx context.Context, sender messageSender, cfg config, history []
 				}
 			}
 			summary := summarizeInput(block.Name, input)
+			call := paint(ansiCyan, fmt.Sprintf("● %s(%s)", block.Name, summary))
 			if block.Name == "bash" && !cfg.sandbox {
-				report("● %s(%s) [no sandbox]", block.Name, summary)
-			} else {
-				report("● %s(%s)", block.Name, summary)
+				call += " " + paint(ansiYellow, "[no sandbox]")
 			}
+			report("%s", call)
 			if isMutating(block.Name) && !confirm(block.Name, summary) {
 				results = append(results, toolError(block.ID, "denied by user; do not retry without asking"))
-				report("  denied")
+				report("%s", paint(ansiYellow, "  denied"))
 				continue
 			}
 			out, err := executeToolSandboxed(ctx, block.Name, input, cfg.sandbox)
@@ -101,7 +101,7 @@ func runPrompt(ctx context.Context, sender messageSender, cfg config, history []
 					out = err.Error()
 				}
 				results = append(results, toolError(block.ID, out))
-				report("  error: %s", firstLine(err.Error()))
+				report("%s", paint(ansiRed, fmt.Sprintf("  error: %s", firstLine(err.Error()))))
 				continue
 			}
 			results = append(results, contentBlock{Type: "tool_result", ToolUseID: block.ID, Content: out})
