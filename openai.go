@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -120,10 +121,13 @@ func decodeChatResponse(status int, raw []byte) (*messageResponse, error) {
 }
 
 type chatMessage struct {
-	Role       string         `json:"role"`
-	Content    string         `json:"content,omitempty"`
-	ToolCalls  []chatToolCall `json:"tool_calls,omitempty"`
-	ToolCallID string         `json:"tool_call_id,omitempty"`
+	Role    string `json:"role"`
+	Content string `json:"content,omitempty"`
+	// ReasoningContent carries DeepSeek-R1 style reasoning when the backend
+	// returns it alongside (or instead of) content. Never sent; only read.
+	ReasoningContent string         `json:"reasoning_content,omitempty"`
+	ToolCalls        []chatToolCall `json:"tool_calls,omitempty"`
+	ToolCallID       string         `json:"tool_call_id,omitempty"`
 }
 
 type chatToolCall struct {
@@ -206,18 +210,35 @@ func toChatRequest(req messageRequest) chatRequest {
 					},
 				})
 			}
+			// DeepSeek (and strict OpenAI-compatible endpoints) reject
+			// assistant messages with neither content nor tool_calls, so
+			// drop them: they carry no information the model can use.
+			if strings.TrimSpace(assistant.Content) == "" && len(assistant.ToolCalls) == 0 {
+				continue
+			}
 			out.Messages = append(out.Messages, assistant)
 		default: // user (and anything else) maps to user/tool messages
 			if text != "" || len(blocks) == 0 {
-				out.Messages = append(out.Messages, chatMessage{Role: "user", Content: text})
+				if strings.TrimSpace(text) == "" && len(blocks) == 0 {
+					// An empty user turn carries nothing; skip it
+					// rather than sending a content-less message.
+					continue
+				}
+				if strings.TrimSpace(text) != "" {
+					out.Messages = append(out.Messages, chatMessage{Role: "user", Content: text})
+				}
 			}
 			for _, b := range blocks {
 				if b.Type != "tool_result" {
 					continue
 				}
+				content := b.Content
+				if strings.TrimSpace(content) == "" {
+					content = "(no output)"
+				}
 				out.Messages = append(out.Messages, chatMessage{
 					Role:       "tool",
-					Content:    b.Content,
+					Content:    content,
 					ToolCallID: b.ToolUseID,
 				})
 			}
@@ -243,8 +264,15 @@ func fromChatChoice(choice struct {
 	FinishReason string      `json:"finish_reason"`
 }, id string, promptTokens, completionTokens int) *messageResponse {
 	resp := &messageResponse{ID: id}
-	if choice.Message.Content != "" {
-		resp.Content = append(resp.Content, contentBlock{Type: "text", Text: choice.Message.Content})
+	text := choice.Message.Content
+	if strings.TrimSpace(text) == "" {
+		// DeepSeek-R1 style responses put thinking in reasoning_content
+		// with an empty content; prefer it over an empty final answer so
+		// the turn still carries text.
+		text = choice.Message.ReasoningContent
+	}
+	if text != "" {
+		resp.Content = append(resp.Content, contentBlock{Type: "text", Text: text})
 	}
 	for _, call := range choice.Message.ToolCalls {
 		args := call.Function.Arguments

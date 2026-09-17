@@ -113,6 +113,81 @@ func TestOpenRouterResponseFinalText(t *testing.T) {
 	}
 }
 
+// TestChatRequestSkipsEmptyAssistant guards the DeepSeek 400
+// ("Invalid assistant message: content or tool_calls must be set"): an empty
+// final answer stored in history must not be sent back as a content-less
+// assistant message on the next turn.
+func TestChatRequestSkipsEmptyAssistant(t *testing.T) {
+	req := messageRequest{
+		Model:  "deepseek-chat",
+		System: "s",
+		Messages: []message{
+			textMessage("user", "do thing"),
+			blocksMessage("assistant", []contentBlock{
+				{Type: "tool_use", ID: "call_1", Name: "bash",
+					Input: json.RawMessage(`{"command":"ls"}`)},
+			}),
+			blocksMessage("user", []contentBlock{
+				{Type: "tool_result", ToolUseID: "call_1", Content: "main.go"},
+			}),
+			blocksMessage("assistant", nil), // empty final answer
+			textMessage("user", "what did you do?"),
+		},
+		Tools: toolDefinitions(),
+	}
+	chat := toChatRequest(req)
+	raw, _ := json.Marshal(chat)
+	var wire struct {
+		Messages []chatMessage `json:"messages"`
+	}
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range wire.Messages {
+		if m.Role == "assistant" && strings.TrimSpace(m.Content) == "" && len(m.ToolCalls) == 0 {
+			t.Errorf("invalid assistant message would get a 400: %+v", m)
+		}
+	}
+	foundFollowUp := false
+	for _, m := range wire.Messages {
+		if m.Role == "user" && m.Content == "what did you do?" {
+			foundFollowUp = true
+		}
+	}
+	if !foundFollowUp {
+		t.Errorf("follow-up prompt missing: %+v", wire.Messages)
+	}
+}
+
+func TestChatRequestEmptyToolResult(t *testing.T) {
+	req := messageRequest{
+		Model: "deepseek-chat",
+		Messages: []message{
+			textMessage("user", "hi"),
+			blocksMessage("user", []contentBlock{
+				{Type: "tool_result", ToolUseID: "call_1", Content: ""},
+			}),
+		},
+	}
+	chat := toChatRequest(req)
+	for _, m := range chat.Messages {
+		if m.Role == "tool" && strings.TrimSpace(m.Content) == "" {
+			t.Errorf("empty tool message would be rejected: %+v", m)
+		}
+	}
+}
+
+func TestChatResponseReasoningFallback(t *testing.T) {
+	raw := []byte(`{"id":"gen_3","choices":[{"message":{"role":"assistant","content":"","reasoning_content":"thinking trace"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+	resp, err := decodeChatResponse(200, raw)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if responseText(resp) != "thinking trace" {
+		t.Errorf("reasoning_content should back empty content, got %q", responseText(resp))
+	}
+}
+
 func TestOpenRouterResponseErrors(t *testing.T) {
 	if _, err := decodeChatResponse(401, []byte(`{"error":{"message":"bad key"}}`)); err == nil ||
 		!strings.Contains(err.Error(), "401") {
