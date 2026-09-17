@@ -4,8 +4,8 @@ Harnais is a lightweight agentic harness written in Go, similar to pi or
 Claude Code but smaller in scope and more human sized.
 
 It runs an agent loop against a model backend — Anthropic's Messages API
-by default, any model on OpenRouter, or the DeepSeek API (both via an
-OpenAI-compatible endpoint). The model can call exactly four tools —
+by default, any model on OpenRouter, or the DeepSeek / OpenAI APIs (all via
+an OpenAI-compatible endpoint). The model can call exactly four tools —
 `bash`, `read`, `edit`, `write` — and the harness executes them locally,
 feeds the results back, and repeats until the model gives a final answer.
 The implementation uses only the Go standard library.
@@ -14,8 +14,8 @@ The implementation uses only the Go standard library.
 
 - Go 1.24 or newer (module targets `go 1.27.1`)
 - An API key for your backend: `ANTHROPIC_API_KEY` (default),
-  `OPENROUTER_API_KEY` with `-provider=openrouter`, or `DEEPSEEK_API_KEY`
-  with `-provider=deepseek`
+  `OPENROUTER_API_KEY` with `-provider=openrouter`, `DEEPSEEK_API_KEY`
+  with `-provider=deepseek`, or `OPENAI_API_KEY` with `-provider=openai`
 
 ## Build
 
@@ -47,6 +47,13 @@ export DEEPSEEK_API_KEY=sk-...
 harnais -provider=deepseek "explain what main.go does"
 ```
 
+Or OpenAI directly:
+
+```sh
+export OPENAI_API_KEY=sk-...
+harnais -provider=openai "explain what main.go does"
+```
+
 Start an interactive session (history is kept until `/reset` or `/exit`):
 
 ```sh
@@ -57,7 +64,7 @@ harnais
 
 | Flag           | Default                        | Meaning                                        |
 | -------------- | ------------------------------ | ---------------------------------------------- |
-| `-provider`    | `anthropic`                    | Backend: `anthropic`, `openrouter` or `deepseek` (`HARNAIS_PROVIDER` overrides the default) |
+| `-provider`    | `anthropic`                    | Backend: `anthropic`, `openrouter`, `deepseek` or `openai` (`HARNAIS_PROVIDER` overrides the default) |
 | `-model`       | per-provider (see below)       | Model ID (`ANTHROPIC_MODEL` overrides the default) |
 | `-key`         | per-provider env var           | API key                                        |
 | `-n`           | `25`                           | Max agent iterations per prompt                |
@@ -68,7 +75,7 @@ harnais
 
 Default models: `claude-sonnet-4-20250514` for `-provider=anthropic`,
 `anthropic/claude-sonnet-4.5` for `-provider=openrouter`, `deepseek-chat`
-for `-provider=deepseek`.
+for `-provider=deepseek`, `gpt-5-mini` for `-provider=openai`.
 
 | Environment          | Meaning                                              |
 | -------------------- | ---------------------------------------------------- |
@@ -81,6 +88,8 @@ for `-provider=deepseek`.
 | `OPENROUTER_REFERER` | Optional `HTTP-Referer` header sent to OpenRouter    |
 | `DEEPSEEK_API_KEY`   | API key for `-provider=deepseek`                     |
 | `DEEPSEEK_BASE_URL`  | DeepSeek API root (default `https://api.deepseek.com`) |
+| `OPENAI_API_KEY`     | API key for `-provider=openai`                       |
+| `OPENAI_BASE_URL`    | OpenAI API root (default `https://api.openai.com/v1`) |
 
 Interactive commands: `/help`, `/reset`, `/exit`.
 
@@ -106,7 +115,7 @@ only in a disposable checkout).
 - `main.go` — CLI flags, one-shot mode, interactive REPL
 - `agent.go` — the agentic tool-use loop and system prompt
 - `anthropic.go` — minimal Messages API client (`net/http` + `encoding/json`)
-- `openai.go` — OpenAI-compatible client (OpenRouter, DeepSeek) translated onto the same loop
+- `openai.go` — OpenAI-compatible client (OpenRouter, DeepSeek, OpenAI) translated onto the same loop
 - `tools.go` — the four tool implementations
 - `tools_test.go` — tool tests (`go test ./...`)
 

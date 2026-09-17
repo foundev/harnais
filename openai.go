@@ -12,7 +12,8 @@ import (
 )
 
 // Provider roots and default models for the OpenAI-compatible backends.
-// Base URLs are overridable with OPENROUTER_BASE_URL / DEEPSEEK_BASE_URL.
+// Base URLs are overridable with OPENROUTER_BASE_URL / DEEPSEEK_BASE_URL /
+// OPENAI_BASE_URL.
 const defaultOpenRouterBaseURL = "https://openrouter.ai/api/v1"
 
 // defaultOpenRouterModel applies when -model is unset with -provider=openrouter.
@@ -23,9 +24,14 @@ const defaultDeepSeekBaseURL = "https://api.deepseek.com"
 // defaultDeepSeekModel applies when -model is unset with -provider=deepseek.
 const defaultDeepSeekModel = "deepseek-chat"
 
+const defaultOpenAIBaseURL = "https://api.openai.com/v1"
+
+// defaultOpenAIModel applies when -model is unset with -provider=openai.
+const defaultOpenAIModel = "gpt-5-mini"
+
 // openAICompatClient speaks OpenAI-style /chat/completions, shared by the
-// OpenRouter and DeepSeek backends. Translation to and from the harness
-// message shape lives in toChatRequest / decodeChatResponse.
+// OpenRouter, DeepSeek, and OpenAI backends. Translation to and from the
+// harness message shape lives in toChatRequest / decodeChatResponse.
 type openAICompatClient struct {
 	http    *http.Client
 	apiKey  string
@@ -43,6 +49,14 @@ func newOpenRouterClient(apiKey, baseURL string) *openAICompatClient {
 }
 
 func newDeepSeekClient(apiKey, baseURL string) *openAICompatClient {
+	return &openAICompatClient{
+		http:    &http.Client{Timeout: 180 * time.Second},
+		apiKey:  apiKey,
+		baseURL: baseURL,
+	}
+}
+
+func newOpenAIClient(apiKey, baseURL string) *openAICompatClient {
 	return &openAICompatClient{
 		http:    &http.Client{Timeout: 180 * time.Second},
 		apiKey:  apiKey,

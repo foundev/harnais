@@ -156,9 +156,25 @@ func TestResolveBackend(t *testing.T) {
 	if _, _, err := resolveBackend("openrouter", "", ""); err == nil {
 		t.Error("expected missing-key error for openrouter")
 	}
+	t.Setenv("OPENAI_API_KEY", "oai")
+	sender, model, err = resolveBackend("openai", "", "")
+	if err != nil {
+		t.Fatalf("openai: %v", err)
+	}
+	if _, ok := sender.(*openAICompatClient); !ok {
+		t.Errorf("expected *openAICompatClient, got %T", sender)
+	}
+	if model != defaultOpenAIModel {
+		t.Errorf("unexpected openai default model %q", model)
+	}
+
 	t.Setenv("DEEPSEEK_API_KEY", "")
 	if _, _, err := resolveBackend("deepseek", "", ""); err == nil {
 		t.Error("expected missing-key error for deepseek")
+	}
+	t.Setenv("OPENAI_API_KEY", "")
+	if _, _, err := resolveBackend("openai", "", ""); err == nil {
+		t.Error("expected missing-key error for openai")
 	}
 	if _, _, err := resolveBackend("nope", "k", "m"); err == nil {
 		t.Error("expected error for unknown provider")

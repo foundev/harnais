@@ -18,7 +18,7 @@ func main() {
 
 func run(args []string) int {
 	fs := flag.NewFlagSet("harnais", flag.ContinueOnError)
-	provider := fs.String("provider", envOr("HARNAIS_PROVIDER", "anthropic"), "Backend: anthropic, openrouter or deepseek.")
+	provider := fs.String("provider", envOr("HARNAIS_PROVIDER", "anthropic"), "Backend: anthropic, openrouter, deepseek or openai.")
 	model := fs.String("model", envOr("ANTHROPIC_MODEL", ""), "Model ID (default depends on -provider).")
 	apiKey := fs.String("key", "", "API key (or ANTHROPIC_API_KEY / OPENROUTER_API_KEY).")
 	maxTokens := fs.Int("max-tokens", 8192, "Max tokens per model response.")
@@ -47,9 +47,11 @@ Environment:
   OPENROUTER_REFERER   Optional HTTP-Referer header for OpenRouter rankings.
   DEEPSEEK_API_KEY     API key for -provider=deepseek.
   DEEPSEEK_BASE_URL    DeepSeek API root (default %s).
+  OPENAI_API_KEY       API key for -provider=openai.
+  OPENAI_BASE_URL      OpenAI API root (default %s).
 
 Interactive commands: /help  /reset  /exit
-`, defaultBaseURL, defaultOpenRouterBaseURL, defaultDeepSeekBaseURL)
+`, defaultBaseURL, defaultOpenRouterBaseURL, defaultDeepSeekBaseURL, defaultOpenAIBaseURL)
 	}
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -136,8 +138,15 @@ func resolveBackend(provider, keyFlag, modelFlag string) (messageSender, string,
 		}
 		model := firstNonEmpty(modelFlag, defaultDeepSeekModel)
 		return newDeepSeekClient(key, envOr("DEEPSEEK_BASE_URL", defaultDeepSeekBaseURL)), model, nil
+	case "openai":
+		key := firstNonEmpty(keyFlag, os.Getenv("OPENAI_API_KEY"))
+		if key == "" {
+			return nil, "", fmt.Errorf("missing API key — set OPENAI_API_KEY or pass -key")
+		}
+		model := firstNonEmpty(modelFlag, defaultOpenAIModel)
+		return newOpenAIClient(key, envOr("OPENAI_BASE_URL", defaultOpenAIBaseURL)), model, nil
 	default:
-		return nil, "", fmt.Errorf("unknown provider %q — use anthropic, openrouter or deepseek", provider)
+		return nil, "", fmt.Errorf("unknown provider %q — use anthropic, openrouter, deepseek or openai", provider)
 	}
 }
 
