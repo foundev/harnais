@@ -16,6 +16,9 @@ type config struct {
 	extraSystem string
 	// effort is reasoning effort (low/medium/high, "" = backend default).
 	effort string
+	// sandbox runs bash under the OS sandbox. Zero value off; run() sets
+	// it from --no-sandbox so production defaults to on.
+	sandbox bool
 }
 
 func systemPrompt(extra string) string {
@@ -80,13 +83,17 @@ func runPrompt(ctx context.Context, sender messageSender, cfg config, history []
 				}
 			}
 			summary := summarizeInput(block.Name, input)
-			report("● %s(%s)", block.Name, summary)
+			if block.Name == "bash" && !cfg.sandbox {
+				report("● %s(%s) [no sandbox]", block.Name, summary)
+			} else {
+				report("● %s(%s)", block.Name, summary)
+			}
 			if isMutating(block.Name) && !confirm(block.Name, summary) {
 				results = append(results, toolError(block.ID, "denied by user; do not retry without asking"))
 				report("  denied")
 				continue
 			}
-			out, err := executeTool(ctx, block.Name, input)
+			out, err := executeToolSandboxed(ctx, block.Name, input, cfg.sandbox)
 			if err != nil {
 				if out == "" {
 					out = err.Error()

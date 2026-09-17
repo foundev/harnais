@@ -109,6 +109,7 @@ effect there. `-effort` sets it for one-shot mode too.
 | `-n`           | `25`                           | Max agent iterations per prompt                |
 | `-max-tokens`  | `8192`                         | Max tokens per model response                  |
 | `-y`           | `false`                        | Run mutating tools without asking              |
+| `-no-sandbox`  | `false`                        | Run `bash` without the OS sandbox              |
 | `-system`      | `""`                           | Extra system instructions                      |
 | `-version`     | —                              | Print version and exit                         |
 
@@ -148,9 +149,18 @@ stderr, so `harnais "prompt" > answer.txt` captures just the final answer.
 | `edit`  | `path`, `find`, `replace`                | Replaces one exact match; fails unless the match is unique    |
 | `write` | `path`, `content`                        | Creates or overwrites a file, making parent directories       |
 
-There is deliberately no sandboxing yet: the agent runs shell commands as
-your user with your environment. Review proposed commands (or run with `-y`
-only in a disposable checkout).
+## Sandbox
+
+`bash` runs under an OS sandbox by default (macOS Seatbelt, modeled on
+[Codex's sandbox](https://github.com/openai/codex/tree/main/codex-rs/sandboxing)):
+deny-by-default, writes confined to the command workdir plus standard
+temp/cache locations, no network. Reads stay open and `read`/`edit`/`write`
+are unaffected (path-confined and still confirmed). The agent cannot switch
+sandboxing off per-call — only the `--no-sandbox` process flag escapes, so
+prompt injection can't break out that way. Unsandboxed runs are marked
+`[no sandbox]` in the progress output, and sandbox denials name the escape
+hatch. Other platforms currently run unsandboxed with a one-time warning
+(Linux confinement is the follow-up).
 
 ## Layout
 
@@ -164,7 +174,7 @@ only in a disposable checkout).
 
 ## Roadmap
 
-- sandboxing
+- Linux sandboxing (bubblewrap/Landlock, mirroring Codex)
 - MCP support (Model Context Protocol)
 - ACP support (Agent Client Protocol)
 - Remote access via a web server

@@ -28,6 +28,7 @@ func run(args []string) int {
 	effort := fs.String("effort", "", "Reasoning effort: low, medium or high (codex, openai, openrouter backends).")
 	maxIters := fs.Int("n", 25, "Max agent iterations per prompt.")
 	skipConfirm := fs.Bool("y", false, "Run mutating tools (bash, edit, write) without asking.")
+	noSandbox := fs.Bool("no-sandbox", false, "Run bash without the OS sandbox (macOS Seatbelt).")
 	extraSystem := fs.String("system", "", "Extra system instructions for the agent.")
 	showVersion := fs.Bool("version", false, "Print version and exit.")
 	fs.Usage = func() {
@@ -99,6 +100,7 @@ In a session, type /help for slash commands (/provider, /model, /effort, /reset,
 		skipConfirm: *skipConfirm,
 		extraSystem: *extraSystem,
 		effort:      firstNonEmpty(*effort, stored.Effort),
+		sandbox:     !*noSandbox,
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)

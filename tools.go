@@ -89,13 +89,19 @@ func toolDefinitions() []toolDefinition {
 	}
 }
 
-// executeTool dispatches one tool call. A non-nil error marks the result
-// as a tool error; the returned string (when non-empty) still reaches the
-// model so it can react to failure output.
+// executeTool dispatches one tool call with sandboxing off (unit-test and
+// library default). The agent loop uses executeToolSandboxed so bash runs
+// under the OS sandbox unless the process opted out with --no-sandbox —
+// the sandbox switch is deliberately not a tool argument, so a prompt
+// injection cannot talk the model into disabling it.
 func executeTool(ctx context.Context, name string, input map[string]any) (string, error) {
+	return executeToolSandboxed(ctx, name, input, false)
+}
+
+func executeToolSandboxed(ctx context.Context, name string, input map[string]any, sandbox bool) (string, error) {
 	switch name {
 	case "bash":
-		return runBash(ctx, input)
+		return runBash(ctx, input, sandbox)
 	case "read":
 		return runRead(input)
 	case "edit":
@@ -119,7 +125,7 @@ func numArg(input map[string]any, key string, def float64) float64 {
 	return def
 }
 
-func runBash(ctx context.Context, input map[string]any) (string, error) {
+func runBash(ctx context.Context, input map[string]any, sandbox bool) (string, error) {
 	command := strArg(input, "command")
 	if strings.TrimSpace(command) == "" {
 		return "", fmt.Errorf("bash: command is required")
@@ -138,8 +144,28 @@ func runBash(ctx context.Context, input map[string]any) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, time.Duration(timeoutMs)*time.Millisecond)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "sh", "-c", command)
+	name, args := "sh", []string{"-c", command}
+	sandboxed := false
+	env := []string{}
+	if sandbox {
+		if !sandboxSupported() {
+			warnSandboxUnsupported()
+		} else {
+			roots := sandboxRoots(workdir)
+			argv := sandboxArgv(roots, sandboxProfile(roots), command)
+			name, args = argv[0], argv[1:]
+			sandboxed = true
+			env = append(os.Environ(),
+				"HARNAIS_SANDBOX=1",
+				"HARNAIS_SANDBOX_NETWORK_DISABLED=1",
+			)
+		}
+	}
+	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Dir = workdir
+	if sandboxed {
+		cmd.Env = env
+	}
 	var buf bytes.Buffer
 	cmd.Stdout = &buf
 	cmd.Stderr = &buf
@@ -151,12 +177,18 @@ func runBash(ctx context.Context, input map[string]any) (string, error) {
 	if out == "" {
 		out = "(no output)"
 	}
+	// Seatbelt denials surface as cryptic "operation not permitted" exits;
+	// say what actually happened and name the escape hatch.
+	hint := ""
+	if sandboxed {
+		hint = "\n(sandboxed: denied by the OS sandbox — rerun harnais with --no-sandbox if this needs network or files outside the workdir)"
+	}
 	if ctx.Err() == context.DeadlineExceeded {
-		return fmt.Sprintf("timeout after %v\n--- output ---\n%s", elapsed.Round(time.Millisecond), out),
+		return fmt.Sprintf("timeout after %v\n--- output ---\n%s%s", elapsed.Round(time.Millisecond), out, hint),
 			fmt.Errorf("bash: command timed out after %v", elapsed.Round(time.Millisecond))
 	}
 	if err != nil {
-		return fmt.Sprintf("exit: %v\nduration: %v\n--- output ---\n%s", err, elapsed.Round(time.Millisecond), out),
+		return fmt.Sprintf("exit: %v\nduration: %v\n--- output ---\n%s%s", err, elapsed.Round(time.Millisecond), out, hint),
 			fmt.Errorf("bash: %v", err)
 	}
 	return fmt.Sprintf("duration: %v\n--- output ---\n%s", elapsed.Round(time.Millisecond), out), nil
