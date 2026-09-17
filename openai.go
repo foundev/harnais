@@ -37,10 +37,6 @@ type openAICompatClient struct {
 	apiKey  string
 	baseURL string
 	referer string
-	// stripReasoningEffort drops reasoning_effort for backends without a
-	// native setting (DeepSeek always reasons; the field would only risk a
-	// rejection). OpenAI and OpenRouter keep it.
-	stripReasoningEffort bool
 }
 
 func newOpenRouterClient(apiKey, baseURL string) *openAICompatClient {
@@ -54,10 +50,9 @@ func newOpenRouterClient(apiKey, baseURL string) *openAICompatClient {
 
 func newDeepSeekClient(apiKey, baseURL string) *openAICompatClient {
 	return &openAICompatClient{
-		http:                 &http.Client{Timeout: 180 * time.Second},
-		apiKey:               apiKey,
-		baseURL:              baseURL,
-		stripReasoningEffort: true,
+		http:    &http.Client{Timeout: 180 * time.Second},
+		apiKey:  apiKey,
+		baseURL: baseURL,
 	}
 }
 
@@ -69,14 +64,12 @@ func newOpenAIClient(apiKey, baseURL string) *openAICompatClient {
 	}
 }
 
-// buildChatRequest translates the harness request and applies per-backend
-// capability policy. Pure so the mapping stays testable without network.
+// buildChatRequest translates the harness request. Every OpenAI-compatible
+// backend (OpenAI, OpenRouter, DeepSeek) accepts reasoning_effort, so it
+// passes through untouched. Pure so the mapping stays testable without
+// network.
 func (c *openAICompatClient) buildChatRequest(req messageRequest) chatRequest {
-	out := toChatRequest(req)
-	if c.stripReasoningEffort {
-		out.ReasoningEffort = nil
-	}
-	return out
+	return toChatRequest(req)
 }
 
 func (c *openAICompatClient) createMessage(ctx context.Context, req messageRequest) (*messageResponse, error) {

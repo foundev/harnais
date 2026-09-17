@@ -25,7 +25,7 @@ func run(args []string) int {
 	printMode := fs.String("p", "", "Run one non-interactive prompt and exit, e.g. -p \"fix the failing test\" (so flags can follow the prompt).")
 	apiKey := fs.String("key", "", "API key (not used by the codex backend, which reads the Codex login).")
 	maxTokens := fs.Int("max-tokens", 8192, "Max tokens per model response.")
-	effort := fs.String("effort", "", "Reasoning effort: low, medium or high (codex, openai, openrouter backends).")
+	effort := fs.String("effort", "", "Reasoning effort: low, medium or high (sent to all backends).")
 	maxIters := fs.Int("n", 25, "Max agent iterations per prompt.")
 	noSandbox := fs.Bool("no-sandbox", false, "Run bash without the OS sandbox (macOS Seatbelt).")
 	extraSystem := fs.String("system", "", "Extra system instructions for the agent.")
@@ -261,9 +261,6 @@ func ensureSender(sess *session) error {
 	return nil
 }
 
-// effortBackends lists where /effort is sent on the wire.
-const effortBackends = "codex, openai, openrouter"
-
 func validEffort(level string) bool {
 	switch level {
 	case "low", "medium", "high":
@@ -308,7 +305,7 @@ func handleSlash(sess *session, line string, report progressFunc) (handled, exit
 		report(`Prompts go straight to the model. Commands:
   /provider [name]   show or switch backend (anthropic, openrouter, deepseek, openai, codex); switching saves provider and model as the default for next launch and keeps history
   /model [id]        show or set the model id (saved as default)
-  /effort [level]    show or set reasoning effort: low, medium, high, default (saved as default; sent to ` + effortBackends + ` backends only)
+  /effort [level]    show or set reasoning effort: low, medium, high, default (saved as default; sent to all backends)
   /reset             clear conversation history
   /exit              leave`)
 	case "/provider":
@@ -335,7 +332,7 @@ func handleSlash(sess *session, line string, report progressFunc) (handled, exit
 		persistSession(sess, report, fmt.Sprintf("model: %s", sess.cfg.model))
 	case "/effort":
 		if len(fields) < 2 {
-			report("effort: %s (sent to %s backends only)", describeEffort(sess), effortBackends)
+			report("effort: %s (sent to all backends)", describeEffort(sess))
 			break
 		}
 		if fields[1] == "default" {
@@ -348,7 +345,7 @@ func handleSlash(sess *session, line string, report progressFunc) (handled, exit
 			break
 		}
 		sess.cfg.effort = fields[1]
-		persistSession(sess, report, fmt.Sprintf("effort: %s (sent to %s backends only)", sess.cfg.effort, effortBackends))
+		persistSession(sess, report, fmt.Sprintf("effort: %s (sent to all backends)", sess.cfg.effort))
 	default:
 		report("%s", paint(ansiRed, fmt.Sprintf("unknown command %q — type /help", fields[0])))
 	}

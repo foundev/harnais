@@ -97,10 +97,10 @@ Provider, model, and effort persist in `$XDG_CONFIG_HOME/harnais/config.json`
 session or one-shot — starts with the same triple. `-model` and `-effort`
 override the saved values for one run without changing them.
 
-`/effort` is sent on the wire to the `codex` (`reasoning.effort`),
-`openai` and `openrouter` (`reasoning_effort`) backends. Anthropic has no
-equivalent setting and DeepSeek always reasons, so the command has no
-effect there. `-effort` sets it for one-shot mode too.
+`/effort` is sent on the wire to every backend: `codex`
+(`reasoning.effort`), `openai`, `openrouter` and `deepseek`
+(`reasoning_effort`), and `anthropic` (`output_config.effort`).
+`-effort` sets it for one-shot mode too.
 
 | Flag           | Default                        | Meaning                                        |
 | -------------- | ------------------------------ | ---------------------------------------------- |
@@ -108,7 +108,7 @@ effect there. `-effort` sets it for one-shot mode too.
 | `-p`           | `""`                           | One non-interactive prompt and exit (so flags can follow the prompt) |
 | `-model`       | saved, else per-provider (see below) | Model ID for this run (`ANTHROPIC_MODEL` overrides the default) |
 | `-key`         | per-provider env var           | API key                                        |
-| `-effort`      | saved, else `""`               | Reasoning effort for this run: `low`, `medium`, `high` (codex, openai, openrouter) |
+| `-effort`      | saved, else `""`               | Reasoning effort for this run: `low`, `medium`, `high` (all backends) |
 | `-n`           | `25`                           | Max agent iterations per prompt                |
 | `-max-tokens`  | `8192`                         | Max tokens per model response                  |
 | `-no-sandbox`  | `false`                        | Run `bash` without the OS sandbox              |

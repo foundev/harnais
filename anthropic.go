@@ -53,9 +53,18 @@ type messageRequest struct {
 	System    string           `json:"system,omitempty"`
 	Messages  []message        `json:"messages"`
 	Tools     []toolDefinition `json:"tools,omitempty"`
-	// Effort is harness-internal (never sent to Anthropic): reasoning
-	// effort for backends with a native setting (codex, openai, openrouter).
+	// Effort is harness-internal: reasoning effort (low/medium/high),
+	// projected onto output_config.effort on the wire (see createMessage).
 	Effort string `json:"-"`
+	// OutputConfig carries effort to the Anthropic API; nil (the default
+	// when no effort is set) omits it so backend-default behavior stays.
+	OutputConfig *outputConfig `json:"output_config,omitempty"`
+}
+
+// outputConfig mirrors the Anthropic Messages API output_config block,
+// currently used only for reasoning effort.
+type outputConfig struct {
+	Effort string `json:"effort,omitempty"`
 }
 
 type messageResponse struct {
@@ -82,8 +91,17 @@ func newAnthropicClient(apiKey, baseURL string) *anthropicClient {
 	}
 }
 
+// buildAnthropicRequest projects harness-internal effort onto the wire
+// shape. Pure so the mapping stays testable without network.
+func buildAnthropicRequest(req messageRequest) messageRequest {
+	if req.Effort != "" {
+		req.OutputConfig = &outputConfig{Effort: req.Effort}
+	}
+	return req
+}
+
 func (c *anthropicClient) createMessage(ctx context.Context, req messageRequest) (*messageResponse, error) {
-	body, err := json.Marshal(req)
+	body, err := json.Marshal(buildAnthropicRequest(req))
 	if err != nil {
 		return nil, fmt.Errorf("encode request: %w", err)
 	}

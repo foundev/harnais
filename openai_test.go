@@ -93,8 +93,8 @@ func TestBuildChatRequestEffort(t *testing.T) {
 		t.Errorf("openrouter client should keep reasoning_effort: %+v", chat.ReasoningEffort)
 	}
 	chat = newDeepSeekClient("k", "http://x").buildChatRequest(req)
-	if chat.ReasoningEffort != nil {
-		t.Errorf("deepseek client should strip reasoning_effort: %+v", chat.ReasoningEffort)
+	if chat.ReasoningEffort == nil || *chat.ReasoningEffort != "high" {
+		t.Errorf("deepseek client should keep reasoning_effort: %+v", chat.ReasoningEffort)
 	}
 	chat = newOpenAIClient("k", "http://x").buildChatRequest(messageRequest{Model: "m"})
 	if chat.ReasoningEffort != nil {
