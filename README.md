@@ -4,18 +4,20 @@ Harnais is a lightweight agentic harness written in Go, similar to pi or
 Claude Code but smaller in scope and more human sized.
 
 It runs an agent loop against a model backend — Anthropic's Messages API
-by default, any model on OpenRouter, or the DeepSeek / OpenAI APIs (all via
-an OpenAI-compatible endpoint). The model can call exactly four tools —
-`bash`, `read`, `edit`, `write` — and the harness executes them locally,
-feeds the results back, and repeats until the model gives a final answer.
-The implementation uses only the Go standard library.
+by default, any model on OpenRouter, the DeepSeek / OpenAI APIs (all via an
+OpenAI-compatible endpoint), or your ChatGPT subscription by reusing the
+Codex CLI login. The model can call exactly four tools — `bash`, `read`,
+`edit`, `write` — and the harness executes them locally, feeds the results
+back, and repeats until the model gives a final answer. The implementation
+uses only the Go standard library.
 
 ## Requirements
 
 - Go 1.24 or newer (module targets `go 1.27.1`)
-- An API key for your backend: `ANTHROPIC_API_KEY` (default),
+- A credential for your backend: `ANTHROPIC_API_KEY` (default),
   `OPENROUTER_API_KEY` with `-provider=openrouter`, `DEEPSEEK_API_KEY`
-  with `-provider=deepseek`, or `OPENAI_API_KEY` with `-provider=openai`
+  with `-provider=deepseek`, `OPENAI_API_KEY` with `-provider=openai`,
+  or a Codex CLI login (`codex login`) with `-provider=codex`
 
 ## Build
 
@@ -54,6 +56,15 @@ export OPENAI_API_KEY=sk-...
 harnais -provider=openai "explain what main.go does"
 ```
 
+Or bill your ChatGPT subscription through the Codex login you already have —
+no API key needed. Auth is Codex's job (`codex login` / `codex logout`);
+harnais only reads `~/.codex/auth.json` (or `$CODEX_HOME/auth.json`),
+refreshing the access token the same way Codex CLI does:
+
+```sh
+harnais -provider=codex "explain what main.go does"
+```
+
 Start an interactive session (history is kept until `/reset` or `/exit`):
 
 ```sh
@@ -64,7 +75,7 @@ harnais
 
 | Flag           | Default                        | Meaning                                        |
 | -------------- | ------------------------------ | ---------------------------------------------- |
-| `-provider`    | `anthropic`                    | Backend: `anthropic`, `openrouter`, `deepseek` or `openai` (`HARNAIS_PROVIDER` overrides the default) |
+| `-provider`    | `anthropic`                    | Backend: `anthropic`, `openrouter`, `deepseek`, `openai` or `codex` (`HARNAIS_PROVIDER` overrides the default) |
 | `-model`       | per-provider (see below)       | Model ID (`ANTHROPIC_MODEL` overrides the default) |
 | `-key`         | per-provider env var           | API key                                        |
 | `-n`           | `25`                           | Max agent iterations per prompt                |
@@ -75,7 +86,8 @@ harnais
 
 Default models: `claude-sonnet-4-20250514` for `-provider=anthropic`,
 `anthropic/claude-sonnet-4.5` for `-provider=openrouter`, `deepseek-chat`
-for `-provider=deepseek`, `gpt-5-mini` for `-provider=openai`.
+for `-provider=deepseek`, `gpt-5-mini` for `-provider=openai`,
+`gpt-5.3-codex` for `-provider=codex`.
 
 | Environment          | Meaning                                              |
 | -------------------- | ---------------------------------------------------- |
@@ -90,6 +102,8 @@ for `-provider=deepseek`, `gpt-5-mini` for `-provider=openai`.
 | `DEEPSEEK_BASE_URL`  | DeepSeek API root (default `https://api.deepseek.com`) |
 | `OPENAI_API_KEY`     | API key for `-provider=openai`                       |
 | `OPENAI_BASE_URL`    | OpenAI API root (default `https://api.openai.com/v1`) |
+| `CODEX_HOME`         | Directory holding Codex `auth.json` (default `~/.codex`) |
+| `CODEX_BASE_URL`     | Codex backend root (default `https://chatgpt.com/backend-api/codex`) |
 
 Interactive commands: `/help`, `/reset`, `/exit`.
 
@@ -116,6 +130,7 @@ only in a disposable checkout).
 - `agent.go` — the agentic tool-use loop and system prompt
 - `anthropic.go` — minimal Messages API client (`net/http` + `encoding/json`)
 - `openai.go` — OpenAI-compatible client (OpenRouter, DeepSeek, OpenAI) translated onto the same loop
+- `codex.go` — Codex subscription backend: reuses the Codex CLI login, speaks the Responses API
 - `tools.go` — the four tool implementations
 - `tools_test.go` — tool tests (`go test ./...`)
 
@@ -129,7 +144,6 @@ only in a disposable checkout).
 - Image support
 - @ files to add them to the context
 - Z.ai subscription support
-- Codex subscription support
 
 ## License
 

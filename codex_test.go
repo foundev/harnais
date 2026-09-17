@@ -1,0 +1,204 @@
+package main
+
+import (
+	"encoding/base64"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+func craftJWT(t *testing.T, claims map[string]any) string {
+	t.Helper()
+	raw, err := json.Marshal(claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return "h." + base64.RawURLEncoding.EncodeToString(raw) + ".s"
+}
+
+func writeAuthJSON(t *testing.T, dir, content string) string {
+	t.Helper()
+	path := filepath.Join(dir, "auth.json")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestCodexResponsesTranslation(t *testing.T) {
+	req := messageRequest{
+		Model:  "gpt-5.3-codex",
+		System: "be brief",
+		Messages: []message{
+			textMessage("user", "list files"),
+			blocksMessage("assistant", []contentBlock{
+				{Type: "text", Text: "on it"},
+				{Type: "tool_use", ID: "call_1", Name: "bash",
+					Input: json.RawMessage(`{"command":"ls"}`)},
+			}),
+			blocksMessage("user", []contentBlock{
+				{Type: "tool_result", ToolUseID: "call_1", Content: "main.go"},
+			}),
+		},
+		Tools: toolDefinitions(),
+	}
+	r := toResponsesRequest(req)
+
+	if r.Model != req.Model || r.Instructions != "be brief" {
+		t.Fatalf("model/instructions not carried over: %+v", r)
+	}
+	if len(r.Input) != 4 {
+		t.Fatalf("expected 4 input items, got %d: %+v", len(r.Input), r.Input)
+	}
+	if r.Input[0].Type != "message" || r.Input[0].Role != "user" ||
+		r.Input[0].Content[0].Type != "input_text" {
+		t.Errorf("user item wrong: %+v", r.Input[0])
+	}
+	call := r.Input[2]
+	if call.Type != "function_call" || call.CallID != "call_1" ||
+		call.Name != "bash" || call.Arguments != `{"command":"ls"}` {
+		t.Errorf("function_call wrong: %+v", call)
+	}
+	out := r.Input[3]
+	if out.Type != "function_call_output" || out.CallID != "call_1" || out.Output != "main.go" {
+		t.Errorf("function_call_output wrong: %+v", out)
+	}
+	if len(r.Tools) != 4 || r.Tools[0].Type != "function" || r.Tools[0].Name != "bash" {
+		t.Fatalf("tools not converted: %+v", r.Tools)
+	}
+}
+
+func TestCodexDecodeWithFunctionCall(t *testing.T) {
+	raw := []byte(`{"id":"resp_1","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"running"}]},{"type":"function_call","call_id":"call_2","name":"read","arguments":"{\"path\":\"main.go\"}"}],"usage":{"input_tokens":10,"output_tokens":5}}`)
+	resp, err := decodeResponsesResponse(200, raw)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.StopReason != "tool_use" {
+		t.Errorf("function_call must continue the loop, got %q", resp.StopReason)
+	}
+	if len(resp.Content) != 2 || resp.Content[0].Text != "running" {
+		t.Fatalf("text block wrong: %+v", resp.Content)
+	}
+	use := resp.Content[1]
+	if use.Type != "tool_use" || use.ID != "call_2" || use.Name != "read" ||
+		string(use.Input) != `{"path":"main.go"}` {
+		t.Errorf("tool_use block wrong: %+v", use)
+	}
+	if resp.Usage.InputTokens != 10 || resp.Usage.OutputTokens != 5 {
+		t.Errorf("usage wrong: %+v", resp.Usage)
+	}
+}
+
+func TestCodexDecodeFinalText(t *testing.T) {
+	raw := []byte(`{"id":"resp_2","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}]}`)
+	resp, err := decodeResponsesResponse(200, raw)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.StopReason != "end_turn" || responseText(resp) != "done" {
+		t.Errorf("final answer wrong: %+v", resp)
+	}
+}
+
+func TestCodexDecodeErrors(t *testing.T) {
+	if _, err := decodeResponsesResponse(401, []byte(`unauthorized`)); err == nil ||
+		!strings.Contains(err.Error(), "401") {
+		t.Errorf("expected status error, got %v", err)
+	}
+	if _, err := decodeResponsesResponse(200, []byte(`{"error":{"message":"usage limited"}}`)); err == nil ||
+		!strings.Contains(err.Error(), "usage limited") {
+		t.Errorf("expected body error, got %v", err)
+	}
+	if _, err := decodeResponsesResponse(200, []byte(`{"id":"x","status":"completed","output":[]}`)); err == nil {
+		t.Error("expected error for empty output")
+	}
+}
+
+func TestLoadCodexTokens(t *testing.T) {
+	dir := t.TempDir()
+	access := craftJWT(t, map[string]any{"exp": time.Now().Add(time.Hour).Unix()})
+	path := writeAuthJSON(t, dir, `{"auth_mode":"chatgpt","tokens":{"id_token":"i","access_token":"`+access+`","refresh_token":"r","account_id":"acct_1"},"last_refresh":"2026-09-14T04:36:32Z"}`)
+	tok, err := loadCodexTokens(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if tok.RefreshToken != "r" || tok.AccountID != "acct_1" {
+		t.Errorf("tokens wrong: %+v", tok)
+	}
+
+	apiKeyPath := writeAuthJSON(t, t.TempDir(), `{"auth_mode":"apikey","OPENAI_API_KEY":"sk-x"}`)
+	if _, err := loadCodexTokens(apiKeyPath); err == nil ||
+		!strings.Contains(err.Error(), "codex login") {
+		t.Errorf("expected codex-login error for apikey mode, got %v", err)
+	}
+	if _, err := loadCodexTokens(filepath.Join(dir, "missing.json")); err == nil ||
+		!strings.Contains(err.Error(), "codex login") {
+		t.Errorf("expected codex-login error for missing file, got %v", err)
+	}
+}
+
+func TestCodexJWTExp(t *testing.T) {
+	future := time.Now().Add(time.Hour).Truncate(time.Second)
+	exp, err := codexJWTExp(craftJWT(t, map[string]any{"exp": future.Unix()}))
+	if err != nil {
+		t.Fatalf("exp: %v", err)
+	}
+	if !exp.Equal(future) {
+		t.Errorf("exp wrong: got %v want %v", exp, future)
+	}
+	if _, err := codexJWTExp("not-a-jwt"); err == nil {
+		t.Error("expected error for malformed token")
+	}
+}
+
+func TestCodexAccountIDFallback(t *testing.T) {
+	access := craftJWT(t, map[string]any{
+		"exp":                         time.Now().Add(time.Hour).Unix(),
+		"https://api.openai.com/auth": map[string]any{"chatgpt_account_id": "acct_jwt"},
+	})
+	got, err := codexAccountID(&codexTokens{AccessToken: access})
+	if err != nil {
+		t.Fatalf("fallback: %v", err)
+	}
+	if got != "acct_jwt" {
+		t.Errorf("fallback account wrong: %q", got)
+	}
+	got, err = codexAccountID(&codexTokens{AccessToken: access, AccountID: "acct_stored"})
+	if err != nil || got != "acct_stored" {
+		t.Errorf("stored account should win: %q, %v", got, err)
+	}
+	if _, err := codexAccountID(&codexTokens{AccessToken: "bad"}); err == nil {
+		t.Error("expected error when no account is resolvable")
+	}
+}
+
+func TestResolveBackendCodex(t *testing.T) {
+	dir := t.TempDir()
+	access := craftJWT(t, map[string]any{"exp": time.Now().Add(time.Hour).Unix()})
+	writeAuthJSON(t, dir, `{"auth_mode":"chatgpt","tokens":{"access_token":"`+access+`","refresh_token":"r","account_id":"acct_1"}}`)
+	t.Setenv("CODEX_HOME", dir)
+
+	sender, model, err := resolveBackend("codex", "", "")
+	if err != nil {
+		t.Fatalf("codex: %v", err)
+	}
+	client, ok := sender.(*codexClient)
+	if !ok {
+		t.Fatalf("expected *codexClient, got %T", sender)
+	}
+	if model != defaultCodexModel {
+		t.Errorf("unexpected codex default model %q", model)
+	}
+	if client.authPath != filepath.Join(dir, "auth.json") {
+		t.Errorf("auth path should honor CODEX_HOME: %q", client.authPath)
+	}
+
+	t.Setenv("CODEX_HOME", t.TempDir())
+	if _, _, err := resolveBackend("codex", "", ""); err == nil {
+		t.Error("expected error when auth.json is missing")
+	}
+}

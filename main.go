@@ -18,9 +18,9 @@ func main() {
 
 func run(args []string) int {
 	fs := flag.NewFlagSet("harnais", flag.ContinueOnError)
-	provider := fs.String("provider", envOr("HARNAIS_PROVIDER", "anthropic"), "Backend: anthropic, openrouter, deepseek or openai.")
+	provider := fs.String("provider", envOr("HARNAIS_PROVIDER", "anthropic"), "Backend: anthropic, openrouter, deepseek, openai or codex.")
 	model := fs.String("model", envOr("ANTHROPIC_MODEL", ""), "Model ID (default depends on -provider).")
-	apiKey := fs.String("key", "", "API key (or ANTHROPIC_API_KEY / OPENROUTER_API_KEY).")
+	apiKey := fs.String("key", "", "API key (not used by -provider=codex, which reads the Codex login).")
 	maxTokens := fs.Int("max-tokens", 8192, "Max tokens per model response.")
 	maxIters := fs.Int("n", 25, "Max agent iterations per prompt.")
 	skipConfirm := fs.Bool("y", false, "Run mutating tools (bash, edit, write) without asking.")
@@ -38,7 +38,7 @@ Flags:
 		fs.PrintDefaults()
 		fmt.Fprintf(os.Stderr, `
 Environment:
-  HARNAIS_PROVIDER     Backend, anthropic or openrouter (default anthropic).
+  HARNAIS_PROVIDER     Backend (default anthropic).
   ANTHROPIC_API_KEY    API key for -provider=anthropic.
   ANTHROPIC_MODEL      Default -model value (either provider).
   ANTHROPIC_BASE_URL   Anthropic API root (default %s).
@@ -49,9 +49,11 @@ Environment:
   DEEPSEEK_BASE_URL    DeepSeek API root (default %s).
   OPENAI_API_KEY       API key for -provider=openai.
   OPENAI_BASE_URL      OpenAI API root (default %s).
+  CODEX_HOME           Directory holding Codex auth.json (default ~/.codex).
+  CODEX_BASE_URL       Codex backend root (default %s).
 
 Interactive commands: /help  /reset  /exit
-`, defaultBaseURL, defaultOpenRouterBaseURL, defaultDeepSeekBaseURL, defaultOpenAIBaseURL)
+`, defaultBaseURL, defaultOpenRouterBaseURL, defaultDeepSeekBaseURL, defaultOpenAIBaseURL, defaultCodexBaseURL)
 	}
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -145,8 +147,18 @@ func resolveBackend(provider, keyFlag, modelFlag string) (messageSender, string,
 		}
 		model := firstNonEmpty(modelFlag, defaultOpenAIModel)
 		return newOpenAIClient(key, envOr("OPENAI_BASE_URL", defaultOpenAIBaseURL)), model, nil
+	case "codex":
+		authPath, err := codexAuthPath()
+		if err != nil {
+			return nil, "", err
+		}
+		if _, err := loadCodexTokens(authPath); err != nil {
+			return nil, "", err
+		}
+		model := firstNonEmpty(modelFlag, defaultCodexModel)
+		return newCodexClient(authPath, envOr("CODEX_BASE_URL", defaultCodexBaseURL)), model, nil
 	default:
-		return nil, "", fmt.Errorf("unknown provider %q — use anthropic, openrouter, deepseek or openai", provider)
+		return nil, "", fmt.Errorf("unknown provider %q — use anthropic, openrouter, deepseek, openai or codex", provider)
 	}
 }
 
