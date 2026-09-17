@@ -11,22 +11,30 @@ import (
 	"time"
 )
 
-// defaultOpenRouterBaseURL is the OpenAI-compatible API root.
-// Override with OPENROUTER_BASE_URL.
+// Provider roots and default models for the OpenAI-compatible backends.
+// Base URLs are overridable with OPENROUTER_BASE_URL / DEEPSEEK_BASE_URL.
 const defaultOpenRouterBaseURL = "https://openrouter.ai/api/v1"
 
 // defaultOpenRouterModel applies when -model is unset with -provider=openrouter.
 const defaultOpenRouterModel = "anthropic/claude-sonnet-4.5"
 
-type openRouterClient struct {
+const defaultDeepSeekBaseURL = "https://api.deepseek.com"
+
+// defaultDeepSeekModel applies when -model is unset with -provider=deepseek.
+const defaultDeepSeekModel = "deepseek-chat"
+
+// openAICompatClient speaks OpenAI-style /chat/completions, shared by the
+// OpenRouter and DeepSeek backends. Translation to and from the harness
+// message shape lives in toChatRequest / decodeChatResponse.
+type openAICompatClient struct {
 	http    *http.Client
 	apiKey  string
 	baseURL string
 	referer string
 }
 
-func newOpenRouterClient(apiKey, baseURL string) *openRouterClient {
-	return &openRouterClient{
+func newOpenRouterClient(apiKey, baseURL string) *openAICompatClient {
+	return &openAICompatClient{
 		http:    &http.Client{Timeout: 180 * time.Second},
 		apiKey:  apiKey,
 		baseURL: baseURL,
@@ -34,7 +42,15 @@ func newOpenRouterClient(apiKey, baseURL string) *openRouterClient {
 	}
 }
 
-func (c *openRouterClient) createMessage(ctx context.Context, req messageRequest) (*messageResponse, error) {
+func newDeepSeekClient(apiKey, baseURL string) *openAICompatClient {
+	return &openAICompatClient{
+		http:    &http.Client{Timeout: 180 * time.Second},
+		apiKey:  apiKey,
+		baseURL: baseURL,
+	}
+}
+
+func (c *openAICompatClient) createMessage(ctx context.Context, req messageRequest) (*messageResponse, error) {
 	body, err := json.Marshal(toChatRequest(req))
 	if err != nil {
 		return nil, fmt.Errorf("encode request: %w", err)

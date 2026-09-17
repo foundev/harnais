@@ -125,8 +125,8 @@ func TestResolveBackend(t *testing.T) {
 	if err != nil {
 		t.Fatalf("openrouter: %v", err)
 	}
-	if _, ok := sender.(*openRouterClient); !ok {
-		t.Errorf("expected *openRouterClient, got %T", sender)
+	if _, ok := sender.(*openAICompatClient); !ok {
+		t.Errorf("expected *openAICompatClient, got %T", sender)
 	}
 	if model != defaultOpenRouterModel {
 		t.Errorf("unexpected openrouter default model %q", model)
@@ -140,9 +140,25 @@ func TestResolveBackend(t *testing.T) {
 		t.Errorf("flag model not honored, got %q", model)
 	}
 
+	t.Setenv("DEEPSEEK_API_KEY", "dk")
+	sender, model, err = resolveBackend("deepseek", "", "")
+	if err != nil {
+		t.Fatalf("deepseek: %v", err)
+	}
+	if _, ok := sender.(*openAICompatClient); !ok {
+		t.Errorf("expected *openAICompatClient, got %T", sender)
+	}
+	if model != defaultDeepSeekModel {
+		t.Errorf("unexpected deepseek default model %q", model)
+	}
+
 	t.Setenv("OPENROUTER_API_KEY", "")
 	if _, _, err := resolveBackend("openrouter", "", ""); err == nil {
 		t.Error("expected missing-key error for openrouter")
+	}
+	t.Setenv("DEEPSEEK_API_KEY", "")
+	if _, _, err := resolveBackend("deepseek", "", ""); err == nil {
+		t.Error("expected missing-key error for deepseek")
 	}
 	if _, _, err := resolveBackend("nope", "k", "m"); err == nil {
 		t.Error("expected error for unknown provider")
