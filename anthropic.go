@@ -81,6 +81,7 @@ type anthropicClient struct {
 	http    *http.Client
 	apiKey  string
 	baseURL string
+	retry   retryPolicy
 }
 
 func newAnthropicClient(apiKey, baseURL string) *anthropicClient {
@@ -88,6 +89,7 @@ func newAnthropicClient(apiKey, baseURL string) *anthropicClient {
 		http:    &http.Client{Timeout: 180 * time.Second},
 		apiKey:  apiKey,
 		baseURL: baseURL,
+		retry:   defaultRetryPolicy(),
 	}
 }
 
@@ -105,29 +107,55 @@ func (c *anthropicClient) createMessage(ctx context.Context, req messageRequest)
 	if err != nil {
 		return nil, fmt.Errorf("encode request: %w", err)
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/messages", bytes.NewReader(body))
-	if err != nil {
-		return nil, fmt.Errorf("build request: %w", err)
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("X-Api-Key", c.apiKey)
-	httpReq.Header.Set("Anthropic-Version", anthropicVersion)
+	var lastErr error
+	for attempt := 0; ; attempt++ {
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/messages", bytes.NewReader(body))
+		if err != nil {
+			return nil, fmt.Errorf("build request: %w", err)
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("X-Api-Key", c.apiKey)
+		httpReq.Header.Set("Anthropic-Version", anthropicVersion)
 
+		status, raw, err := c.do(httpReq)
+		if err != nil {
+			// Transport failure (timeout, connection, half-read body).
+			lastErr = err
+			if !c.retry.retryTransport || attempt >= c.retry.maxAttempts {
+				return nil, lastErr
+			}
+			if serr := sleepRetry(ctx, c.retry.delayFor(attempt+1)); serr != nil {
+				return nil, lastErr
+			}
+			continue
+		}
+		if c.retry.retryableStatus(status) && attempt < c.retry.maxAttempts {
+			lastErr = fmt.Errorf("api error %d: %s", status, truncateOutput(string(raw)))
+			if serr := sleepRetry(ctx, c.retry.delayFor(attempt+1)); serr != nil {
+				return nil, lastErr
+			}
+			continue
+		}
+		if status < 200 || status >= 300 {
+			return nil, fmt.Errorf("api error %d: %s", status, truncateOutput(string(raw)))
+		}
+		var out messageResponse
+		if err := json.Unmarshal(raw, &out); err != nil {
+			return nil, fmt.Errorf("decode response: %w", err)
+		}
+		return &out, nil
+	}
+}
+
+func (c *anthropicClient) do(httpReq *http.Request) (int, []byte, error) {
 	resp, err := c.http.Do(httpReq)
 	if err != nil {
-		return nil, fmt.Errorf("api call: %w", err)
+		return 0, nil, fmt.Errorf("api call: %w", err)
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
 	if err != nil {
-		return nil, fmt.Errorf("read response: %w", err)
+		return 0, nil, fmt.Errorf("read response: %w", err)
 	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("api error %d: %s", resp.StatusCode, truncateOutput(string(raw)))
-	}
-	var out messageResponse
-	if err := json.Unmarshal(raw, &out); err != nil {
-		return nil, fmt.Errorf("decode response: %w", err)
-	}
-	return &out, nil
+	return resp.StatusCode, raw, nil
 }

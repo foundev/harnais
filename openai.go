@@ -38,6 +38,7 @@ type openAICompatClient struct {
 	apiKey  string
 	baseURL string
 	referer string
+	retry   retryPolicy
 }
 
 func newOpenRouterClient(apiKey, baseURL string) *openAICompatClient {
@@ -46,6 +47,7 @@ func newOpenRouterClient(apiKey, baseURL string) *openAICompatClient {
 		apiKey:  apiKey,
 		baseURL: baseURL,
 		referer: os.Getenv("OPENROUTER_REFERER"),
+		retry:   defaultRetryPolicy(),
 	}
 }
 
@@ -54,6 +56,7 @@ func newDeepSeekClient(apiKey, baseURL string) *openAICompatClient {
 		http:    &http.Client{Timeout: 180 * time.Second},
 		apiKey:  apiKey,
 		baseURL: baseURL,
+		retry:   defaultRetryPolicy(),
 	}
 }
 
@@ -62,6 +65,7 @@ func newOpenAIClient(apiKey, baseURL string) *openAICompatClient {
 		http:    &http.Client{Timeout: 180 * time.Second},
 		apiKey:  apiKey,
 		baseURL: baseURL,
+		retry:   defaultRetryPolicy(),
 	}
 }
 
@@ -78,27 +82,53 @@ func (c *openAICompatClient) createMessage(ctx context.Context, req messageReque
 	if err != nil {
 		return nil, fmt.Errorf("encode request: %w", err)
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/chat/completions", bytes.NewReader(body))
-	if err != nil {
-		return nil, fmt.Errorf("build request: %w", err)
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
-	httpReq.Header.Set("X-Title", "harnais")
-	if c.referer != "" {
-		httpReq.Header.Set("HTTP-Referer", c.referer)
-	}
+	var lastErr error
+	for attempt := 0; ; attempt++ {
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/chat/completions", bytes.NewReader(body))
+		if err != nil {
+			return nil, fmt.Errorf("build request: %w", err)
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+		httpReq.Header.Set("X-Title", "harnais")
+		if c.referer != "" {
+			httpReq.Header.Set("HTTP-Referer", c.referer)
+		}
 
+		status, raw, err := c.do(httpReq)
+		if err != nil {
+			// Transport failure (timeout, connection, half-read body).
+			lastErr = err
+			if !c.retry.retryTransport || attempt >= c.retry.maxAttempts {
+				return nil, lastErr
+			}
+			if serr := sleepRetry(ctx, c.retry.delayFor(attempt+1)); serr != nil {
+				return nil, lastErr
+			}
+			continue
+		}
+		if c.retry.retryableStatus(status) && attempt < c.retry.maxAttempts {
+			_, lastErr = decodeChatResponse(status, raw)
+			if serr := sleepRetry(ctx, c.retry.delayFor(attempt+1)); serr != nil {
+				return nil, lastErr
+			}
+			continue
+		}
+		return decodeChatResponse(status, raw)
+	}
+}
+
+func (c *openAICompatClient) do(httpReq *http.Request) (int, []byte, error) {
 	resp, err := c.http.Do(httpReq)
 	if err != nil {
-		return nil, fmt.Errorf("api call: %w", err)
+		return 0, nil, fmt.Errorf("api call: %w", err)
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
 	if err != nil {
-		return nil, fmt.Errorf("read response: %w", err)
+		return 0, nil, fmt.Errorf("read response: %w", err)
 	}
-	return decodeChatResponse(resp.StatusCode, raw)
+	return resp.StatusCode, raw, nil
 }
 
 // decodeChatResponse maps an OpenAI-style chat completion onto the harness

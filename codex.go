@@ -234,6 +234,7 @@ type codexClient struct {
 	authPath  string
 	access    string
 	accountID string
+	retry     retryPolicy
 }
 
 func newCodexClient(authPath, baseURL string) *codexClient {
@@ -241,6 +242,7 @@ func newCodexClient(authPath, baseURL string) *codexClient {
 		http:     &http.Client{Timeout: 180 * time.Second},
 		baseURL:  baseURL,
 		authPath: authPath,
+		retry:    defaultRetryPolicy(),
 	}
 }
 
@@ -299,22 +301,51 @@ func (c *codexClient) createMessage(ctx context.Context, req messageRequest) (*m
 	if err := c.ensureAuth(ctx, false); err != nil {
 		return nil, err
 	}
+	var lastErr error
+	refreshed := false
 	for attempt := 0; ; attempt++ {
-		status, raw, err := c.post(ctx, body)
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/responses", bytes.NewReader(body))
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("build request: %w", err)
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("Authorization", "Bearer "+c.access)
+		httpReq.Header.Set("ChatGPT-Account-ID", c.accountID)
+		httpReq.Header.Set("Originator", "codex_cli_rs")
+		httpReq.Header.Set("OpenAI-Beta", "responses=v1")
+		httpReq.Header.Set("User-Agent", "harnais/"+version)
+
+		status, raw, err := c.do(httpReq)
+		if err != nil {
+			// Transport failure (timeout, connection, half-read body).
+			lastErr = err
+			if !c.retry.retryTransport || attempt >= c.retry.maxAttempts {
+				return nil, lastErr
+			}
+			if serr := sleepRetry(ctx, c.retry.delayFor(attempt+1)); serr != nil {
+				return nil, lastErr
+			}
+			continue
 		}
 		dumpDebug(fmt.Sprintf("codex response status=%d attempt=%d", status, attempt), raw)
-		if status == http.StatusUnauthorized && attempt == 0 {
+		if status == http.StatusUnauthorized && !refreshed {
 			// Token may have been revoked or rotated elsewhere; force a
 			// refresh and retry once before surfacing the failure.
 			if rerr := c.ensureAuth(ctx, true); rerr != nil {
 				return nil, rerr
 			}
+			refreshed = true
 			continue
 		}
 		if status == http.StatusUnauthorized {
 			return nil, fmt.Errorf("codex backend rejected auth (401) — run `codex login` again")
+		}
+		if c.retry.retryableStatus(status) && attempt < c.retry.maxAttempts {
+			lastErr = codexStatusError(status, raw)
+			if serr := sleepRetry(ctx, c.retry.delayFor(attempt+1)); serr != nil {
+				return nil, lastErr
+			}
+			continue
 		}
 		if status < 200 || status >= 300 {
 			return nil, codexStatusError(status, raw)
@@ -323,18 +354,7 @@ func (c *codexClient) createMessage(ctx context.Context, req messageRequest) (*m
 	}
 }
 
-func (c *codexClient) post(ctx context.Context, body []byte) (int, []byte, error) {
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/responses", bytes.NewReader(body))
-	if err != nil {
-		return 0, nil, fmt.Errorf("build request: %w", err)
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+c.access)
-	httpReq.Header.Set("ChatGPT-Account-ID", c.accountID)
-	httpReq.Header.Set("Originator", "codex_cli_rs")
-	httpReq.Header.Set("OpenAI-Beta", "responses=v1")
-	httpReq.Header.Set("User-Agent", "harnais/"+version)
-
+func (c *codexClient) do(httpReq *http.Request) (int, []byte, error) {
 	resp, err := c.http.Do(httpReq)
 	if err != nil {
 		return 0, nil, fmt.Errorf("api call: %w", err)
