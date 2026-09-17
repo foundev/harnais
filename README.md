@@ -116,7 +116,7 @@ override the saved values for one run without changing them.
 | `-version`     | —                              | Print version and exit                         |
 
 Default models: `claude-sonnet-4-20250514` for `-provider=anthropic`,
-`anthropic/claude-sonnet-4.5` for `-provider=openrouter`, `deepseek-chat`
+`anthropic/claude-sonnet-4.5` for `-provider=openrouter`, `deepseek-flash`
 for `-provider=deepseek`, `gpt-5-mini` for `-provider=openai`,
 `gpt-5.3-codex` for `-provider=codex`.
 

@@ -24,7 +24,7 @@ func TestOpenRouterRequestTranslation(t *testing.T) {
 		},
 		Tools: toolDefinitions(),
 	}
-	chat := toChatRequest(req)
+	chat := toChatRequest(req, false)
 
 	if chat.Model != req.Model || chat.MaxTokens != req.MaxTokens {
 		t.Fatalf("model/tokens not carried over: %+v", chat)
@@ -135,7 +135,7 @@ func TestChatRequestSkipsEmptyAssistant(t *testing.T) {
 		},
 		Tools: toolDefinitions(),
 	}
-	chat := toChatRequest(req)
+	chat := toChatRequest(req, false)
 	raw, _ := json.Marshal(chat)
 	var wire struct {
 		Messages []chatMessage `json:"messages"`
@@ -169,7 +169,7 @@ func TestChatRequestEmptyToolResult(t *testing.T) {
 			}),
 		},
 	}
-	chat := toChatRequest(req)
+	chat := toChatRequest(req, false)
 	for _, m := range chat.Messages {
 		if m.Role == "tool" && strings.TrimSpace(m.Content) == "" {
 			t.Errorf("empty tool message would be rejected: %+v", m)
@@ -185,6 +185,74 @@ func TestChatResponseReasoningFallback(t *testing.T) {
 	}
 	if responseText(resp) != "thinking trace" {
 		t.Errorf("reasoning_content should back empty content, got %q", responseText(resp))
+	}
+}
+
+func TestChatReasoningEchoDeepSeekOnly(t *testing.T) {
+	req := messageRequest{
+		Model: "m",
+		Messages: []message{
+			textMessage("user", "hi"),
+			blocksMessage("assistant", []contentBlock{
+				{Type: "reasoning", Text: "let me think"},
+				{Type: "text", Text: "hello"},
+			}),
+		},
+		Tools: toolDefinitions(),
+	}
+	chat := toChatRequest(req, true)
+	if len(chat.Messages) != 2 {
+		t.Fatalf("expected 2 messages, got %+v", chat.Messages)
+	}
+	if chat.Messages[1].ReasoningContent != "let me think" {
+		t.Errorf("deepseek must echo reasoning_content, got %q", chat.Messages[1].ReasoningContent)
+	}
+	plain := toChatRequest(req, false)
+	if plain.Messages[1].ReasoningContent != "" {
+		t.Errorf("other backends must not receive reasoning_content, got %q", plain.Messages[1].ReasoningContent)
+	}
+	if got := newDeepSeekClient("k", "http://x").buildChatRequest(req).Messages[1].ReasoningContent; got != "let me think" {
+		t.Errorf("deepseek client must echo, got %q", got)
+	}
+	if got := newOpenAIClient("k", "http://x").buildChatRequest(req).Messages[1].ReasoningContent; got != "" {
+		t.Errorf("openai client must not echo, got %q", got)
+	}
+}
+
+func TestChatReasoningRoundTrip(t *testing.T) {
+	raw := []byte(`{"id":"gen_4","choices":[{"message":{"role":"assistant","content":"","reasoning_content":"checking tools","tool_calls":[{"id":"call_9","type":"function","function":{"name":"read","arguments":"{}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+	resp, err := decodeChatResponse(200, raw)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.StopReason != "tool_use" {
+		t.Fatalf("expected tool_use, got %q", resp.StopReason)
+	}
+	// Empty content falls back to the chain of thought for display,
+	// and the raw chain rides along for the next-turn echo.
+	if responseText(resp) != "checking tools" {
+		t.Errorf("display fallback wrong, got %q", responseText(resp))
+	}
+	req := messageRequest{Model: "m", Messages: []message{
+		textMessage("user", "hi"),
+		blocksMessage("assistant", resp.Content),
+	}, Tools: toolDefinitions()}
+	echoed := toChatRequest(req, true).Messages[1].ReasoningContent
+	if echoed != "checking tools" {
+		t.Errorf("reasoning lost on re-encode, got %q", echoed)
+	}
+}
+
+func TestChatEmptyResponseErrors(t *testing.T) {
+	raw := []byte(`{"id":"gen_5","choices":[{"message":{"role":"assistant","content":""},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+	if _, err := decodeChatResponse(200, raw); err == nil ||
+		!strings.Contains(err.Error(), `finish_reason "stop"`) {
+		t.Errorf("empty stop must fail loudly, got %v", err)
+	}
+	raw = []byte(`{"id":"gen_6","choices":[{"message":{"role":"assistant","content":""},"finish_reason":"length"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+	if _, err := decodeChatResponse(200, raw); err == nil ||
+		!strings.Contains(err.Error(), "max-tokens") {
+		t.Errorf("empty length cut must suggest raising max-tokens, got %v", err)
 	}
 }
 

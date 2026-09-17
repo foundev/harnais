@@ -23,7 +23,7 @@ const defaultOpenRouterModel = "anthropic/claude-sonnet-4.5"
 const defaultDeepSeekBaseURL = "https://api.deepseek.com"
 
 // defaultDeepSeekModel applies when -model is unset with -provider=deepseek.
-const defaultDeepSeekModel = "deepseek-chat"
+const defaultDeepSeekModel = "deepseek-flash"
 
 const defaultOpenAIBaseURL = "https://api.openai.com/v1"
 
@@ -39,6 +39,11 @@ type openAICompatClient struct {
 	baseURL string
 	referer string
 	retry   retryPolicy
+	// echoReasoning sends stored reasoning blocks back as
+	// reasoning_content on assistant messages. DeepSeek requires this
+	// whenever tools are in play (400 otherwise) and ignores it
+	// without tools; other backends must not receive the field.
+	echoReasoning bool
 }
 
 func newOpenRouterClient(apiKey, baseURL string) *openAICompatClient {
@@ -53,10 +58,11 @@ func newOpenRouterClient(apiKey, baseURL string) *openAICompatClient {
 
 func newDeepSeekClient(apiKey, baseURL string) *openAICompatClient {
 	return &openAICompatClient{
-		http:    &http.Client{Timeout: 180 * time.Second},
-		apiKey:  apiKey,
-		baseURL: baseURL,
-		retry:   defaultRetryPolicy(),
+		http:          &http.Client{Timeout: 180 * time.Second},
+		apiKey:        apiKey,
+		baseURL:       baseURL,
+		retry:         defaultRetryPolicy(),
+		echoReasoning: true,
 	}
 }
 
@@ -74,7 +80,7 @@ func newOpenAIClient(apiKey, baseURL string) *openAICompatClient {
 // passes through untouched. Pure so the mapping stays testable without
 // network.
 func (c *openAICompatClient) buildChatRequest(req messageRequest) chatRequest {
-	return toChatRequest(req)
+	return toChatRequest(req, c.echoReasoning)
 }
 
 func (c *openAICompatClient) createMessage(ctx context.Context, req messageRequest) (*messageResponse, error) {
@@ -147,14 +153,25 @@ func decodeChatResponse(status int, raw []byte) (*messageResponse, error) {
 	if len(chat.Choices) == 0 {
 		return nil, fmt.Errorf("api error: response had no choices")
 	}
-	return fromChatChoice(chat.Choices[0], chat.ID, chat.Usage.PromptTokens, chat.Usage.CompletionTokens), nil
+	resp := fromChatChoice(chat.Choices[0], chat.ID, chat.Usage.PromptTokens, chat.Usage.CompletionTokens)
+	if len(resp.Content) == 0 {
+		// An empty end_turn would otherwise surface as a blank answer
+		// with no error. Fail loudly, naming the finish reason so a
+		// length cut carries its own remedy.
+		if fr := chat.Choices[0].FinishReason; fr == "length" {
+			return nil, fmt.Errorf("api error: model returned no content (finish_reason %q) — output hit the token limit; retry with a higher -max-tokens", fr)
+		}
+		return nil, fmt.Errorf("api error: model returned no content (finish_reason %q)", chat.Choices[0].FinishReason)
+	}
+	return resp, nil
 }
 
 type chatMessage struct {
 	Role    string `json:"role"`
 	Content string `json:"content,omitempty"`
-	// ReasoningContent carries DeepSeek-R1 style reasoning when the backend
-	// returns it alongside (or instead of) content. Never sent; only read.
+	// ReasoningContent carries DeepSeek thinking-mode reasoning. Read off
+	// every response; sent back on assistant messages only by backends
+	// that require it (DeepSeek with tools), never otherwise.
 	ReasoningContent string         `json:"reasoning_content,omitempty"`
 	ToolCalls        []chatToolCall `json:"tool_calls,omitempty"`
 	ToolCallID       string         `json:"tool_call_id,omitempty"`
@@ -207,8 +224,11 @@ type chatResponse struct {
 
 // toChatRequest converts the harness message history to OpenAI-style chat
 // messages. Assistant tool_use blocks become tool_calls; tool_result blocks
-// become standalone tool messages carrying the tool_call_id.
-func toChatRequest(req messageRequest) chatRequest {
+// become standalone tool messages carrying the tool_call_id. Assistant
+// reasoning blocks round-trip as reasoning_content only when echoReasoning
+// is set (DeepSeek thinking mode with tools requires the full chain back;
+// other backends must not see the field).
+func toChatRequest(req messageRequest, echoReasoning bool) chatRequest {
 	out := chatRequest{Model: req.Model, MaxTokens: req.MaxTokens}
 	if req.Effort != "" {
 		effort := req.Effort
@@ -223,22 +243,30 @@ func toChatRequest(req messageRequest) chatRequest {
 		case "assistant":
 			assistant := chatMessage{Role: "assistant"}
 			assistant.Content = text
+			var reasoning []string
 			for _, b := range blocks {
-				if b.Type != "tool_use" {
-					continue
+				switch b.Type {
+				case "tool_use":
+					args := string(b.Input)
+					if args == "" {
+						args = "{}"
+					}
+					assistant.ToolCalls = append(assistant.ToolCalls, chatToolCall{
+						ID:   b.ID,
+						Type: "function",
+						Function: chatFunctionCall{
+							Name:      b.Name,
+							Arguments: args,
+						},
+					})
+				case "reasoning":
+					if strings.TrimSpace(b.Text) != "" {
+						reasoning = append(reasoning, b.Text)
+					}
 				}
-				args := string(b.Input)
-				if args == "" {
-					args = "{}"
-				}
-				assistant.ToolCalls = append(assistant.ToolCalls, chatToolCall{
-					ID:   b.ID,
-					Type: "function",
-					Function: chatFunctionCall{
-						Name:      b.Name,
-						Arguments: args,
-					},
-				})
+			}
+			if echoReasoning && len(reasoning) > 0 {
+				assistant.ReasoningContent = strings.Join(reasoning, "\n")
 			}
 			// DeepSeek (and strict OpenAI-compatible endpoints) reject
 			// assistant messages with neither content nor tool_calls, so
@@ -296,13 +324,19 @@ func fromChatChoice(choice struct {
 	resp := &messageResponse{ID: id}
 	text := choice.Message.Content
 	if strings.TrimSpace(text) == "" {
-		// DeepSeek-R1 style responses put thinking in reasoning_content
-		// with an empty content; prefer it over an empty final answer so
-		// the turn still carries text.
+		// DeepSeek thinking-mode responses put the chain of thought in
+		// reasoning_content with an empty content; prefer it over an
+		// empty final answer so the turn still carries text.
 		text = choice.Message.ReasoningContent
 	}
 	if text != "" {
 		resp.Content = append(resp.Content, contentBlock{Type: "text", Text: text})
+	}
+	// Keep the raw chain of thought alongside the display text so
+	// reasoning-aware backends get it echoed back on the next turn.
+	// responseText and the reviewer transcript only read text blocks.
+	if strings.TrimSpace(choice.Message.ReasoningContent) != "" {
+		resp.Content = append(resp.Content, contentBlock{Type: "reasoning", Text: choice.Message.ReasoningContent})
 	}
 	for _, call := range choice.Message.ToolCalls {
 		args := call.Function.Arguments
