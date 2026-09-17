@@ -53,6 +53,7 @@ type progressFunc func(format string, args ...any)
 func runPrompt(ctx context.Context, sender messageSender, cfg config, history []message, prompt string, confirm confirmFunc, report progressFunc) (string, []message, error) {
 	history = append(history, textMessage("user", prompt))
 	for i := 0; i < cfg.maxIters; i++ {
+		spin := startSpinner("thinking")
 		resp, err := sender.createMessage(ctx, messageRequest{
 			Model:     cfg.model,
 			MaxTokens: cfg.maxTokens,
@@ -61,6 +62,7 @@ func runPrompt(ctx context.Context, sender messageSender, cfg config, history []
 			Tools:     toolDefinitions(),
 			Effort:    cfg.effort,
 		})
+		spin.finish()
 		if err != nil {
 			return "", history, err
 		}

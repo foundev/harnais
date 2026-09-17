@@ -68,7 +68,8 @@ harnais -provider=codex "explain what main.go does"
 ```
 
 Start an interactive session (history is kept until `/reset` or `/exit`).
-The prompt shows the active backend:
+The prompt shows the active backend, with a spinner on stderr while the
+model thinks:
 
 ```sh
 harnais
