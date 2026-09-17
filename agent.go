@@ -12,7 +12,6 @@ type config struct {
 	model       string
 	maxTokens   int
 	maxIters    int
-	skipConfirm bool
 	extraSystem string
 	// effort is reasoning effort (low/medium/high, "" = backend default).
 	effort string
@@ -41,17 +40,17 @@ type messageSender interface {
 	createMessage(ctx context.Context, req messageRequest) (*messageResponse, error)
 }
 
-// confirmFunc decides whether a mutating tool call may run.
-type confirmFunc func(tool, summary string) bool
-
 // progressFunc reports agent activity to the user.
 type progressFunc func(format string, args ...any)
 
 // runPrompt runs one agentic turn: it appends the user prompt to history,
 // loops model calls with tool execution, and returns the final text answer
-// plus the updated history.
-func runPrompt(ctx context.Context, sender messageSender, cfg config, history []message, prompt string, confirm confirmFunc, report progressFunc) (string, []message, error) {
+// plus the updated history. Mutating tool calls pass a reviewer agent first
+// (see review.go); reads run free. There is deliberately no human
+// confirmation step and no per-tool policy matrix.
+func runPrompt(ctx context.Context, sender messageSender, cfg config, history []message, prompt string, report progressFunc) (string, []message, error) {
 	history = append(history, textMessage("user", prompt))
+	consecutiveDenials := 0
 	for i := 0; i < cfg.maxIters; i++ {
 		spin := startSpinner("thinking")
 		resp, err := sender.createMessage(ctx, messageRequest{
@@ -90,12 +89,33 @@ func runPrompt(ctx context.Context, sender messageSender, cfg config, history []
 				call += " " + paint(ansiYellow, "[no sandbox]")
 			}
 			report("%s", call)
-			if isMutating(block.Name) && !confirm(block.Name, summary) {
-				results = append(results, toolError(block.ID, "denied by user; do not retry without asking"))
-				report("%s", paint(ansiYellow, "  denied"))
-				continue
+			if isMutating(block.Name) {
+				approved, rationale, rerr := reviewToolCall(ctx, sender, cfg, history, block.Name, input)
+				if rerr != nil {
+					return "", history, rerr
+				}
+				if !approved {
+					consecutiveDenials++
+					results = append(results, toolError(block.ID,
+						fmt.Sprintf("Reviewer denied this action: %s. Do not pursue the same outcome via workaround, indirect execution, or policy circumvention; continue only with a materially safer alternative, otherwise stop.", rationale)))
+					if rationale == "" {
+						report("%s", paint(ansiYellow, "  review: denied"))
+					} else {
+						report("%s", paint(ansiYellow, fmt.Sprintf("  review: denied — %s", firstLine(rationale))))
+					}
+					if consecutiveDenials >= reviewDenialsToAbort {
+						return "", history, fmt.Errorf("reviewer denied %d actions in a row — turn aborted", consecutiveDenials)
+					}
+					continue
+				}
+				if rationale == "" {
+					report("  review: approved")
+				} else {
+					report("  review: approved — %s", firstLine(rationale))
+				}
 			}
 			out, err := executeToolSandboxed(ctx, block.Name, input, cfg.sandbox)
+			consecutiveDenials = 0
 			if err != nil {
 				if out == "" {
 					out = err.Error()
@@ -128,15 +148,6 @@ func responseText(resp *messageResponse) string {
 func toolError(id, msg string) contentBlock {
 	isErr := true
 	return contentBlock{Type: "tool_result", ToolUseID: id, Content: msg, IsError: &isErr}
-}
-
-func isMutating(tool string) bool {
-	switch tool {
-	case "bash", "edit", "write":
-		return true
-	default:
-		return false
-	}
 }
 
 func summarizeInput(tool string, input map[string]any) string {

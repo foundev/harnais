@@ -111,7 +111,6 @@ effect there. `-effort` sets it for one-shot mode too.
 | `-effort`      | saved, else `""`               | Reasoning effort for this run: `low`, `medium`, `high` (codex, openai, openrouter) |
 | `-n`           | `25`                           | Max agent iterations per prompt                |
 | `-max-tokens`  | `8192`                         | Max tokens per model response                  |
-| `-y`           | `false`                        | Run mutating tools without asking              |
 | `-no-sandbox`  | `false`                        | Run `bash` without the OS sandbox              |
 | `-system`      | `""`                           | Extra system instructions                      |
 | `-version`     | —                              | Print version and exit                         |
@@ -139,9 +138,21 @@ for `-provider=deepseek`, `gpt-5-mini` for `-provider=openai`,
 
 In a session, `/help` lists the slash commands (`/provider`, `/model`, `/effort`, `/reset`, `/exit`).
 
-By default the harness asks before running any mutating tool (`bash`,
-`edit`, `write`); pass `-y` to skip confirmations. Tool progress goes to
-stderr, so `harnais "prompt" > answer.txt` captures just the final answer.
+## Review
+
+There are no human confirmation prompts. Instead, every mutating tool call
+(`bash`, `edit`, `write`; `read` runs free) goes to a separate reviewer
+pass over the same backend before it runs — the same idea as [Codex
+auto-review](https://learn.chatgpt.com/docs/sandboxing/auto-review),
+without its policy config. The reviewer sees a compact transcript plus the
+exact proposed action and answers `APPROVE`/`DENY` with a rationale; a
+denial returns the rationale with instructions to find a materially safer
+path, and three denials in a row abort the turn. Each review costs extra
+model calls on your backend. The OS sandbox (above) still confines every
+`bash` call underneath all of this.
+
+Tool progress, including `review: approved/denied` lines, goes to stderr,
+so `harnais "prompt" > answer.txt` captures just the final answer.
 
 ## Tools
 

@@ -158,7 +158,7 @@ func TestReplPromptWithoutCredential(t *testing.T) {
 	sess := &session{provider: "anthropic", cfg: config{model: "m", maxIters: 1}}
 	report, _ := slashReporter()
 	in := bufio.NewReader(strings.NewReader("hi\n/exit\n"))
-	if code := repl(context.Background(), sess, in, nil, report); code != 0 {
+	if code := repl(context.Background(), sess, in, report); code != 0 {
 		t.Fatalf("repl should survive a credential failure, got exit %d", code)
 	}
 	if sess.sender != nil || len(sess.history) != 0 {

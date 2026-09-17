@@ -27,7 +27,6 @@ func run(args []string) int {
 	maxTokens := fs.Int("max-tokens", 8192, "Max tokens per model response.")
 	effort := fs.String("effort", "", "Reasoning effort: low, medium or high (codex, openai, openrouter backends).")
 	maxIters := fs.Int("n", 25, "Max agent iterations per prompt.")
-	skipConfirm := fs.Bool("y", false, "Run mutating tools (bash, edit, write) without asking.")
 	noSandbox := fs.Bool("no-sandbox", false, "Run bash without the OS sandbox (macOS Seatbelt).")
 	extraSystem := fs.String("system", "", "Extra system instructions for the agent.")
 	showVersion := fs.Bool("version", false, "Print version and exit.")
@@ -97,7 +96,6 @@ In a session, type /help for slash commands (/provider, /model, /effort, /reset,
 		model:       firstNonEmpty(*model, stored.Model, defModel),
 		maxTokens:   *maxTokens,
 		maxIters:    *maxIters,
-		skipConfirm: *skipConfirm,
 		extraSystem: *extraSystem,
 		effort:      firstNonEmpty(*effort, stored.Effort),
 		sandbox:     !*noSandbox,
@@ -106,22 +104,6 @@ In a session, type /help for slash commands (/provider, /model, /effort, /reset,
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 	in := bufio.NewReader(os.Stdin)
-	confirm := func(tool, summary string) bool {
-		if cfg.skipConfirm {
-			return true
-		}
-		fmt.Fprintf(os.Stderr, "%s", paint(ansiYellow, fmt.Sprintf("run %s(%s)? [y/N] ", tool, summary)))
-		line, err := in.ReadString('\n')
-		if err != nil {
-			return false
-		}
-		switch strings.ToLower(strings.TrimSpace(line)) {
-		case "y", "yes":
-			return true
-		default:
-			return false
-		}
-	}
 	report := func(format string, args ...any) {
 		fmt.Fprintf(os.Stderr, format+"\n", args...)
 	}
@@ -138,7 +120,7 @@ In a session, type /help for slash commands (/provider, /model, /effort, /reset,
 			printErr("%v", err)
 			return 2
 		}
-		answer, _, err := runPrompt(ctx, sender, cfg, nil, prompt, confirm, report)
+		answer, _, err := runPrompt(ctx, sender, cfg, nil, prompt, report)
 		if err != nil {
 			printErr("%v", err)
 			return 1
@@ -150,7 +132,7 @@ In a session, type /help for slash commands (/provider, /model, /effort, /reset,
 	// lazily on the first prompt (or eagerly by /provider), so no key is
 	// needed just to open the REPL.
 	sess := &session{provider: provider, cfg: cfg, keyFlag: *apiKey, configPath: cfgPath}
-	return repl(ctx, sess, in, confirm, report)
+	return repl(ctx, sess, in, report)
 }
 
 // resolvePrompt picks the one-shot prompt: -p or positional args, never
@@ -458,7 +440,7 @@ func firstNonEmpty(vals ...string) string {
 	return ""
 }
 
-func repl(ctx context.Context, sess *session, in *bufio.Reader, confirm confirmFunc, report progressFunc) int {
+func repl(ctx context.Context, sess *session, in *bufio.Reader, report progressFunc) int {
 	report("harnais %s — %s (type /help for commands)", version, paint(ansiCyan, sess.provider+"/"+sess.cfg.model))
 	for {
 		fmt.Fprintf(os.Stderr, "%s", paint(ansiBoldCyan, sess.provider+"> "))
@@ -481,7 +463,7 @@ func repl(ctx context.Context, sess *session, in *bufio.Reader, confirm confirmF
 			printErr("%v", err)
 			continue
 		}
-		answer, updated, err := runPrompt(ctx, sess.sender, sess.cfg, sess.history, prompt, confirm, report)
+		answer, updated, err := runPrompt(ctx, sess.sender, sess.cfg, sess.history, prompt, report)
 		if err != nil {
 			printErr("%v", err)
 			continue
