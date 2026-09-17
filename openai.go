@@ -37,6 +37,10 @@ type openAICompatClient struct {
 	apiKey  string
 	baseURL string
 	referer string
+	// stripReasoningEffort drops reasoning_effort for backends without a
+	// native setting (DeepSeek always reasons; the field would only risk a
+	// rejection). OpenAI and OpenRouter keep it.
+	stripReasoningEffort bool
 }
 
 func newOpenRouterClient(apiKey, baseURL string) *openAICompatClient {
@@ -50,9 +54,10 @@ func newOpenRouterClient(apiKey, baseURL string) *openAICompatClient {
 
 func newDeepSeekClient(apiKey, baseURL string) *openAICompatClient {
 	return &openAICompatClient{
-		http:    &http.Client{Timeout: 180 * time.Second},
-		apiKey:  apiKey,
-		baseURL: baseURL,
+		http:                 &http.Client{Timeout: 180 * time.Second},
+		apiKey:               apiKey,
+		baseURL:              baseURL,
+		stripReasoningEffort: true,
 	}
 }
 
@@ -64,8 +69,18 @@ func newOpenAIClient(apiKey, baseURL string) *openAICompatClient {
 	}
 }
 
+// buildChatRequest translates the harness request and applies per-backend
+// capability policy. Pure so the mapping stays testable without network.
+func (c *openAICompatClient) buildChatRequest(req messageRequest) chatRequest {
+	out := toChatRequest(req)
+	if c.stripReasoningEffort {
+		out.ReasoningEffort = nil
+	}
+	return out
+}
+
 func (c *openAICompatClient) createMessage(ctx context.Context, req messageRequest) (*messageResponse, error) {
-	body, err := json.Marshal(toChatRequest(req))
+	body, err := json.Marshal(c.buildChatRequest(req))
 	if err != nil {
 		return nil, fmt.Errorf("encode request: %w", err)
 	}
@@ -141,10 +156,11 @@ type chatFunction struct {
 }
 
 type chatRequest struct {
-	Model     string        `json:"model"`
-	MaxTokens int           `json:"max_tokens,omitempty"`
-	Messages  []chatMessage `json:"messages"`
-	Tools     []chatTool    `json:"tools,omitempty"`
+	Model           string        `json:"model"`
+	MaxTokens       int           `json:"max_tokens,omitempty"`
+	ReasoningEffort *string       `json:"reasoning_effort,omitempty"`
+	Messages        []chatMessage `json:"messages"`
+	Tools           []chatTool    `json:"tools,omitempty"`
 }
 
 type chatResponse struct {
@@ -167,6 +183,10 @@ type chatResponse struct {
 // become standalone tool messages carrying the tool_call_id.
 func toChatRequest(req messageRequest) chatRequest {
 	out := chatRequest{Model: req.Model, MaxTokens: req.MaxTokens}
+	if req.Effort != "" {
+		effort := req.Effort
+		out.ReasoningEffort = &effort
+	}
 	if req.System != "" {
 		out.Messages = append(out.Messages, chatMessage{Role: "system", Content: req.System})
 	}

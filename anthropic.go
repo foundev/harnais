@@ -53,6 +53,9 @@ type messageRequest struct {
 	System    string           `json:"system,omitempty"`
 	Messages  []message        `json:"messages"`
 	Tools     []toolDefinition `json:"tools,omitempty"`
+	// Effort is harness-internal (never sent to Anthropic): reasoning
+	// effort for backends with a native setting (codex, openai, openrouter).
+	Effort string `json:"-"`
 }
 
 type messageResponse struct {

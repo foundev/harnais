@@ -17,7 +17,9 @@ uses only the Go standard library.
 - A credential for your backend: `ANTHROPIC_API_KEY` (default),
   `OPENROUTER_API_KEY` with `-provider=openrouter`, `DEEPSEEK_API_KEY`
   with `-provider=deepseek`, `OPENAI_API_KEY` with `-provider=openai`,
-  or a Codex CLI login (`codex login`) with `-provider=codex`
+  or a Codex CLI login (`codex login`) with `-provider=codex`.
+  Interactive sessions open without any credential — one is only needed
+  when you send the first prompt or switch backends with `/provider`.
 
 ## Build
 
@@ -65,19 +67,45 @@ refreshing the access token the same way Codex CLI does:
 harnais -provider=codex "explain what main.go does"
 ```
 
-Start an interactive session (history is kept until `/reset` or `/exit`):
+Start an interactive session (history is kept until `/reset` or `/exit`).
+The prompt shows the active backend:
 
 ```sh
 harnais
-> explain what main.go does
-> add retry logic to the API client
+anthropic> explain what main.go does
+anthropic> add retry logic to the API client
 ```
+
+The backend is the saved `/provider` choice (`anthropic` on first run).
+One-shot mode uses the saved backend too; `-provider` overrides it for one
+run, and `-p` takes the prompt as a flag so other flags can follow it:
+Session commands:
+
+```sh
+anthropic> /provider openrouter   # switch backend, saved as default (model resets, history kept)
+anthropic> /model my-model        # use a different model id, saved as default
+anthropic> /effort high           # reasoning effort (low, medium, high, default), saved as default
+anthropic> /reset                 # clear history
+anthropic> /exit                  # leave
+```
+
+Provider, model, and effort persist in `$XDG_CONFIG_HOME/harnais/config.json`
+(`~/.config/harnais/config.json` by default), so the next launch —
+session or one-shot — starts with the same triple. `-model` and `-effort`
+override the saved values for one run without changing them.
+
+`/effort` is sent on the wire to the `codex` (`reasoning.effort`),
+`openai` and `openrouter` (`reasoning_effort`) backends. Anthropic has no
+equivalent setting and DeepSeek always reasons, so the command has no
+effect there. `-effort` sets it for one-shot mode too.
 
 | Flag           | Default                        | Meaning                                        |
 | -------------- | ------------------------------ | ---------------------------------------------- |
-| `-provider`    | `anthropic`                    | Backend: `anthropic`, `openrouter`, `deepseek`, `openai` or `codex` (`HARNAIS_PROVIDER` overrides the default) |
-| `-model`       | per-provider (see below)       | Model ID (`ANTHROPIC_MODEL` overrides the default) |
+| `-provider`    | saved (`anthropic` first run)  | Backend for this run, without changing the saved default |
+| `-p`           | `""`                           | One non-interactive prompt and exit (so flags can follow the prompt) |
+| `-model`       | saved, else per-provider (see below) | Model ID for this run (`ANTHROPIC_MODEL` overrides the default) |
 | `-key`         | per-provider env var           | API key                                        |
+| `-effort`      | saved, else `""`               | Reasoning effort for this run: `low`, `medium`, `high` (codex, openai, openrouter) |
 | `-n`           | `25`                           | Max agent iterations per prompt                |
 | `-max-tokens`  | `8192`                         | Max tokens per model response                  |
 | `-y`           | `false`                        | Run mutating tools without asking              |
@@ -91,8 +119,7 @@ for `-provider=deepseek`, `gpt-5-mini` for `-provider=openai`,
 
 | Environment          | Meaning                                              |
 | -------------------- | ---------------------------------------------------- |
-| `HARNAIS_PROVIDER`   | Overrides the default `-provider` value              |
-| `ANTHROPIC_API_KEY`  | API key for `-provider=anthropic`                    |
+| `ANTHROPIC_API_KEY`  | API key for the anthropic backend                    |
 | `ANTHROPIC_MODEL`    | Overrides the default `-model` value (either provider) |
 | `ANTHROPIC_BASE_URL` | Anthropic API root (default `https://api.anthropic.com`) |
 | `OPENROUTER_API_KEY` | API key for `-provider=openrouter`                   |
@@ -104,8 +131,9 @@ for `-provider=deepseek`, `gpt-5-mini` for `-provider=openai`,
 | `OPENAI_BASE_URL`    | OpenAI API root (default `https://api.openai.com/v1`) |
 | `CODEX_HOME`         | Directory holding Codex `auth.json` (default `~/.codex`) |
 | `CODEX_BASE_URL`     | Codex backend root (default `https://chatgpt.com/backend-api/codex`) |
+| `HARNAIS_DEBUG`      | When set to a file path, appends Codex request/response bodies there (never tokens) |
 
-Interactive commands: `/help`, `/reset`, `/exit`.
+In a session, `/help` lists the slash commands (`/provider`, `/model`, `/effort`, `/reset`, `/exit`).
 
 By default the harness asks before running any mutating tool (`bash`,
 `edit`, `write`); pass `-y` to skip confirmations. Tool progress goes to

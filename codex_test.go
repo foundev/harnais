@@ -72,8 +72,15 @@ func TestCodexResponsesTranslation(t *testing.T) {
 }
 
 func TestCodexDecodeWithFunctionCall(t *testing.T) {
-	raw := []byte(`{"id":"resp_1","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"running"}]},{"type":"function_call","call_id":"call_2","name":"read","arguments":"{\"path\":\"main.go\"}"}],"usage":{"input_tokens":10,"output_tokens":5}}`)
-	resp, err := decodeResponsesResponse(200, raw)
+	raw := []byte("event: response.created\n" +
+		"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"status\":\"in_progress\",\"output\":[]}}\n" +
+		"\n" +
+		"event: response.output_text.delta\n" +
+		"data: {\"type\":\"response.output_text.delta\",\"delta\":\"running\"}\n" +
+		"\n" +
+		"event: response.completed\n" +
+		`data: {"type":"response.completed","response":{"id":"resp_1","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"running"}]},{"type":"function_call","call_id":"call_2","name":"read","arguments":"{\"path\":\"main.go\"}"}],"usage":{"input_tokens":10,"output_tokens":5}}}` + "\n")
+	resp, err := decodeResponsesStream(raw)
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}
@@ -93,9 +100,57 @@ func TestCodexDecodeWithFunctionCall(t *testing.T) {
 	}
 }
 
+func TestDumpDebug(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "debug.log")
+	t.Setenv("HARNAIS_DEBUG", path)
+	dumpDebug("thing", []byte(`{"a":1}`))
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "thing") || !strings.Contains(string(raw), `{"a":1}`) {
+		t.Errorf("debug file should hold label and body: %s", raw)
+	}
+}
+
+func TestCodexRequestStoreAndStream(t *testing.T) {
+	raw, err := json.Marshal(toResponsesRequest(messageRequest{Model: "m"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"store":false`) {
+		t.Errorf("backend requires store:false: %s", raw)
+	}
+	if !strings.Contains(string(raw), `"stream":true`) {
+		t.Errorf("backend requires stream:true: %s", raw)
+	}
+}
+
+func TestCodexDetailError(t *testing.T) {
+	// Exact shape the ChatGPT backend returns for a stored request.
+	err := codexStatusError(400, []byte(`{"detail":"Store must be set to false"}`))
+	if err == nil || err.Error() != "api error 400: Store must be set to false" {
+		t.Errorf("detail message should surface cleanly, got %v", err)
+	}
+}
+
+func TestCodexResponsesReasoning(t *testing.T) {
+	req := messageRequest{Model: "m", Effort: "low", Messages: []message{textMessage("user", "hi")}}
+	r := toResponsesRequest(req)
+	if r.Reasoning == nil || r.Reasoning.Effort != "low" {
+		t.Errorf("effort should map to reasoning: %+v", r.Reasoning)
+	}
+	r = toResponsesRequest(messageRequest{Model: "m"})
+	if r.Reasoning != nil {
+		t.Errorf("unset effort should send no reasoning block: %+v", r.Reasoning)
+	}
+}
+
 func TestCodexDecodeFinalText(t *testing.T) {
-	raw := []byte(`{"id":"resp_2","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}]}`)
-	resp, err := decodeResponsesResponse(200, raw)
+	raw := []byte("event: response.completed\n" +
+		`data: {"type":"response.completed","response":{"id":"resp_2","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}]}}` + "\n")
+	resp, err := decodeResponsesStream(raw)
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}
@@ -104,17 +159,69 @@ func TestCodexDecodeFinalText(t *testing.T) {
 	}
 }
 
+func TestCodexStreamItemsFromDoneEvents(t *testing.T) {
+	// Observed live against the ChatGPT backend: complete items stream via
+	// response.output_item.done, then response.completed arrives with an
+	// empty output array. The done items are the answer.
+	raw := []byte("event: response.output_item.done\n" +
+		`data: {"type":"response.output_item.done","output_index":0,"item":{"id":"msg_1","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"ok","annotations":[]}],"phase":"final_answer"}}` + "\n" +
+		"\n" +
+		"event: response.completed\n" +
+		`data: {"type":"response.completed","response":{"id":"resp_1","status":"completed","output":[],"usage":{"input_tokens":474,"output_tokens":5}}}` + "\n")
+	resp, err := decodeResponsesStream(raw)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.StopReason != "end_turn" || responseText(resp) != "ok" {
+		t.Errorf("done-item text lost: %+v", resp)
+	}
+	if resp.Usage.InputTokens != 474 || resp.Usage.OutputTokens != 5 {
+		t.Errorf("terminal usage lost: %+v", resp.Usage)
+	}
+}
+
+func TestCodexStreamToolCallFromDoneEvents(t *testing.T) {
+	raw := []byte("event: response.output_item.done\n" +
+		`data: {"type":"response.output_item.done","output_index":0,"item":{"id":"fc_1","type":"function_call","status":"completed","call_id":"call_2","name":"read","arguments":"{\"path\":\"main.go\"}"}}` + "\n" +
+		"\n" +
+		"event: response.completed\n" +
+		`data: {"type":"response.completed","response":{"id":"resp_1","status":"completed","output":[]}}` + "\n")
+	resp, err := decodeResponsesStream(raw)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.StopReason != "tool_use" || len(resp.Content) != 1 || resp.Content[0].ID != "call_2" {
+		t.Errorf("done-item tool call lost: %+v", resp)
+	}
+}
+
 func TestCodexDecodeErrors(t *testing.T) {
-	if _, err := decodeResponsesResponse(401, []byte(`unauthorized`)); err == nil ||
+	if err := codexStatusError(401, []byte(`unauthorized`)); err == nil ||
 		!strings.Contains(err.Error(), "401") {
 		t.Errorf("expected status error, got %v", err)
 	}
-	if _, err := decodeResponsesResponse(200, []byte(`{"error":{"message":"usage limited"}}`)); err == nil ||
-		!strings.Contains(err.Error(), "usage limited") {
-		t.Errorf("expected body error, got %v", err)
+	// A stream that ends mid-response is a failure, never a silent success.
+	truncated := []byte("event: response.output_text.delta\n" +
+		"data: {\"type\":\"response.output_text.delta\",\"delta\":\"half\"}\n")
+	if _, err := decodeResponsesStream(truncated); err == nil ||
+		!strings.Contains(err.Error(), "without a completed response") {
+		t.Errorf("expected truncated-stream error, got %v", err)
 	}
-	if _, err := decodeResponsesResponse(200, []byte(`{"id":"x","status":"completed","output":[]}`)); err == nil {
-		t.Error("expected error for empty output")
+	if _, err := decodeResponsesStream([]byte("event: error\n" +
+		`data: {"type":"error","message":"usage limited"}` + "\n")); err == nil ||
+		!strings.Contains(err.Error(), "usage limited") {
+		t.Errorf("expected stream error, got %v", err)
+	}
+	failed := []byte("event: response.failed\n" +
+		`data: {"type":"response.failed","response":{"id":"resp_9","status":"failed","output":[],"error":{"message":"boom"}}}` + "\n")
+	if _, err := decodeResponsesStream(failed); err == nil ||
+		!strings.Contains(err.Error(), "boom") {
+		t.Errorf("expected failed-response error, got %v", err)
+	}
+	// A plain (non-stream) error body still decodes instead of confusing.
+	if _, err := decodeResponsesStream([]byte(`{"id":"x","error":{"message":"plain boom"}}`)); err == nil ||
+		!strings.Contains(err.Error(), "plain boom") {
+		t.Errorf("expected plain-body error, got %v", err)
 	}
 }
 

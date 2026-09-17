@@ -14,6 +14,8 @@ type config struct {
 	maxIters    int
 	skipConfirm bool
 	extraSystem string
+	// effort is reasoning effort (low/medium/high, "" = backend default).
+	effort string
 }
 
 func systemPrompt(extra string) string {
@@ -54,6 +56,7 @@ func runPrompt(ctx context.Context, sender messageSender, cfg config, history []
 			System:    systemPrompt(cfg.extraSystem),
 			Messages:  history,
 			Tools:     toolDefinitions(),
+			Effort:    cfg.effort,
 		})
 		if err != nil {
 			return "", history, err

@@ -274,11 +274,28 @@ func (c *codexClient) ensureAuth(ctx context.Context, force bool) error {
 	return nil
 }
 
+// dumpDebug appends a labeled body to the HARNAIS_DEBUG file when set.
+// Only request/response JSON bodies are logged — auth headers and tokens
+// never pass through here.
+func dumpDebug(label string, body []byte) {
+	path := os.Getenv("HARNAIS_DEBUG")
+	if path == "" {
+		return
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	fmt.Fprintf(f, "=== %s (%d bytes, %s) ===\n%s\n", label, len(body), time.Now().UTC().Format(time.RFC3339), body)
+}
+
 func (c *codexClient) createMessage(ctx context.Context, req messageRequest) (*messageResponse, error) {
 	body, err := json.Marshal(toResponsesRequest(req))
 	if err != nil {
 		return nil, fmt.Errorf("encode request: %w", err)
 	}
+	dumpDebug("codex request", body)
 	if err := c.ensureAuth(ctx, false); err != nil {
 		return nil, err
 	}
@@ -287,6 +304,7 @@ func (c *codexClient) createMessage(ctx context.Context, req messageRequest) (*m
 		if err != nil {
 			return nil, err
 		}
+		dumpDebug(fmt.Sprintf("codex response status=%d attempt=%d", status, attempt), raw)
 		if status == http.StatusUnauthorized && attempt == 0 {
 			// Token may have been revoked or rotated elsewhere; force a
 			// refresh and retry once before surfacing the failure.
@@ -298,7 +316,10 @@ func (c *codexClient) createMessage(ctx context.Context, req messageRequest) (*m
 		if status == http.StatusUnauthorized {
 			return nil, fmt.Errorf("codex backend rejected auth (401) — run `codex login` again")
 		}
-		return decodeResponsesResponse(status, raw)
+		if status < 200 || status >= 300 {
+			return nil, codexStatusError(status, raw)
+		}
+		return decodeResponsesStream(raw)
 	}
 }
 
@@ -348,11 +369,23 @@ type responsesTool struct {
 	Parameters  map[string]any `json:"parameters,omitempty"`
 }
 
+type responsesReasoning struct {
+	Effort string `json:"effort"`
+}
+
 type responsesRequest struct {
-	Model        string          `json:"model"`
-	Instructions string          `json:"instructions,omitempty"`
-	Input        []responsesItem `json:"input"`
-	Tools        []responsesTool `json:"tools,omitempty"`
+	Model        string              `json:"model"`
+	Instructions string              `json:"instructions,omitempty"`
+	Reasoning    *responsesReasoning `json:"reasoning,omitempty"`
+	// Store must be false: the ChatGPT backend rejects stored responses.
+	// A pointer with omitempty keeps the field present-but-false rather
+	// than dropping it.
+	Store *bool `json:"store,omitempty"`
+	// Stream must be true: the ChatGPT backend rejects non-streaming
+	// responses calls.
+	Stream bool            `json:"stream"`
+	Input  []responsesItem `json:"input"`
+	Tools  []responsesTool `json:"tools,omitempty"`
 }
 
 type responsesResponse struct {
@@ -372,7 +405,12 @@ type responsesResponse struct {
 // Assistant tool_use blocks become function_call items; tool_result blocks
 // become function_call_output items keyed by call id.
 func toResponsesRequest(req messageRequest) responsesRequest {
-	out := responsesRequest{Model: req.Model, Instructions: req.System}
+	out := responsesRequest{Model: req.Model, Instructions: req.System, Stream: true}
+	noStore := false
+	out.Store = &noStore
+	if req.Effort != "" {
+		out.Reasoning = &responsesReasoning{Effort: req.Effort}
+	}
 	for _, msg := range req.Messages {
 		text, blocks := splitContent(msg.Content)
 		switch msg.Role {
@@ -422,16 +460,135 @@ func toResponsesRequest(req messageRequest) responsesRequest {
 	return out
 }
 
-// decodeResponsesResponse maps one Responses object onto the harness shape.
-// Any function_call in the output continues the agent loop like "tool_use".
-func decodeResponsesResponse(status int, raw []byte) (*messageResponse, error) {
-	if status < 200 || status >= 300 {
-		return nil, fmt.Errorf("api error %d: %s", status, truncateOutput(string(raw)))
+// codexStatusError prefers the backend's own message — this API reports
+// failures as {"detail": ...} — over a raw body dump.
+func codexStatusError(status int, raw []byte) error {
+	var body struct {
+		Detail string `json:"detail"`
+		Error  *struct {
+			Message string `json:"message"`
+		} `json:"error"`
 	}
+	if err := json.Unmarshal(raw, &body); err == nil {
+		if body.Detail != "" {
+			return fmt.Errorf("api error %d: %s", status, body.Detail)
+		}
+		if body.Error != nil && body.Error.Message != "" {
+			return fmt.Errorf("api error %d: %s", status, body.Error.Message)
+		}
+	}
+	return fmt.Errorf("api error %d: %s", status, truncateOutput(string(raw)))
+}
+
+// decodeResponsesStream consumes a text/event-stream body and converts the
+// terminal response.completed event's embedded response object. Incremental
+// delta events are intentionally ignored: per the Responses API docs the
+// terminal event carries the complete object including usage. The ChatGPT
+// backend deviates here — observed live, it streams complete items via
+// response.output_item.done and then sends response.completed with an empty
+// output array — so done items are accumulated as the output fallback.
+// A stream that ends without a terminal event is an error, never a silent
+// success.
+func decodeResponsesStream(raw []byte) (*messageResponse, error) {
+	var terminal json.RawMessage
+	var terminalType string
+	var streamErr string
+	var doneItems []responsesItem
+
+	dispatch := func(event, data string) {
+		switch event {
+		case "response.output_item.done":
+			var env struct {
+				Item responsesItem `json:"item"`
+			}
+			if json.Unmarshal([]byte(data), &env) == nil && env.Item.Type != "" {
+				doneItems = append(doneItems, env.Item)
+			}
+		case "response.completed", "response.failed", "response.incomplete":
+			var env struct {
+				Response json.RawMessage `json:"response"`
+			}
+			if json.Unmarshal([]byte(data), &env) == nil && len(env.Response) > 0 {
+				terminal, terminalType = env.Response, event
+			}
+		case "error":
+			var env struct {
+				Message string `json:"message"`
+				Code    string `json:"code"`
+				Err     string `json:"error"`
+			}
+			msg := ""
+			if json.Unmarshal([]byte(data), &env) == nil {
+				msg = env.Message
+				if msg == "" {
+					msg = env.Err
+				}
+				if msg == "" {
+					msg = env.Code
+				}
+			}
+			if msg == "" {
+				msg = truncateOutput(strings.TrimSpace(data))
+			}
+			streamErr = msg
+		}
+	}
+
+	var event string
+	var data []string
+	flush := func() {
+		if event != "" || len(data) > 0 {
+			dispatch(event, strings.Join(data, "\n"))
+		}
+		event, data = "", nil
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		line = strings.TrimSuffix(line, "\r")
+		if line == "" {
+			flush()
+			continue
+		}
+		if strings.HasPrefix(line, ":") {
+			continue // keep-alive comment
+		}
+		name, value, _ := strings.Cut(line, ":")
+		value = strings.TrimPrefix(value, " ")
+		switch name {
+		case "event":
+			event = value
+		case "data":
+			data = append(data, value)
+		}
+	}
+	flush()
+
+	if streamErr != "" {
+		return nil, fmt.Errorf("api error: %s", streamErr)
+	}
+	if len(terminal) > 0 {
+		var r responsesResponse
+		if err := json.Unmarshal(terminal, &r); err != nil {
+			return nil, fmt.Errorf("decode response: %w", err)
+		}
+		if terminalType == "response.failed" && (r.Error == nil || r.Error.Message == "") {
+			return nil, fmt.Errorf("api error: response failed")
+		}
+		if len(r.Output) == 0 {
+			r.Output = doneItems
+		}
+		return responsesToMessage(&r)
+	}
+	// Not an event stream at all: accept a plain response object so a
+	// non-streaming error body still decodes instead of confusing.
 	var r responsesResponse
-	if err := json.Unmarshal(raw, &r); err != nil {
-		return nil, fmt.Errorf("decode response: %w", err)
+	trimmed := bytes.TrimSpace(raw)
+	if json.Unmarshal(trimmed, &r) == nil && (len(r.Output) > 0 || r.Error != nil) {
+		return responsesToMessage(&r)
 	}
+	return nil, fmt.Errorf("api error: stream ended without a completed response")
+}
+
+func responsesToMessage(r *responsesResponse) (*messageResponse, error) {
 	if r.Error != nil && r.Error.Message != "" {
 		return nil, fmt.Errorf("api error: %s", r.Error.Message)
 	}

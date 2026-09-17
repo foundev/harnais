@@ -81,6 +81,27 @@ func TestOpenRouterResponseWithTools(t *testing.T) {
 	}
 }
 
+func TestBuildChatRequestEffort(t *testing.T) {
+	req := messageRequest{Model: "m", Effort: "high", Messages: []message{textMessage("user", "hi")}}
+
+	chat := newOpenAIClient("k", "http://x").buildChatRequest(req)
+	if chat.ReasoningEffort == nil || *chat.ReasoningEffort != "high" {
+		t.Errorf("openai client should keep reasoning_effort: %+v", chat.ReasoningEffort)
+	}
+	chat = newOpenRouterClient("k", "http://x").buildChatRequest(req)
+	if chat.ReasoningEffort == nil || *chat.ReasoningEffort != "high" {
+		t.Errorf("openrouter client should keep reasoning_effort: %+v", chat.ReasoningEffort)
+	}
+	chat = newDeepSeekClient("k", "http://x").buildChatRequest(req)
+	if chat.ReasoningEffort != nil {
+		t.Errorf("deepseek client should strip reasoning_effort: %+v", chat.ReasoningEffort)
+	}
+	chat = newOpenAIClient("k", "http://x").buildChatRequest(messageRequest{Model: "m"})
+	if chat.ReasoningEffort != nil {
+		t.Errorf("unset effort should send nothing: %+v", chat.ReasoningEffort)
+	}
+}
+
 func TestOpenRouterResponseFinalText(t *testing.T) {
 	raw := []byte(`{"id":"gen_2","choices":[{"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
 	resp, err := decodeChatResponse(200, raw)
