@@ -20,7 +20,7 @@ func main() {
 
 func run(args []string) int {
 	fs := flag.NewFlagSet("harnais", flag.ContinueOnError)
-	providerFlag := fs.String("provider", "", "Backend for this run: anthropic, openrouter, deepseek, openai or codex (overrides the saved default without changing it).")
+	providerFlag := fs.String("provider", "", "Backend for this run: anthropic, openrouter, deepseek, openai, inceptron or codex (overrides the saved default without changing it).")
 	model := fs.String("model", envOr("ANTHROPIC_MODEL", ""), "Model ID (default depends on the saved provider).")
 	printMode := fs.String("p", "", "Run one non-interactive prompt and exit, e.g. -p \"fix the failing test\" (so flags can follow the prompt).")
 	apiKey := fs.String("key", "", "API key (not used by the codex backend, which reads the Codex login).")
@@ -52,11 +52,13 @@ Environment:
   DEEPSEEK_BASE_URL    DeepSeek API root (default %s).
   OPENAI_API_KEY       API key for the openai backend.
   OPENAI_BASE_URL      OpenAI API root (default %s).
+  INCEPTRON_API_KEY    API key for the inceptron backend.
+  INCEPTRON_BASE_URL   Inceptron API root (default %s).
   CODEX_HOME           Directory holding Codex auth.json (default ~/.codex).
   CODEX_BASE_URL       Codex backend root (default %s).
 
 In a session, type /help for slash commands (/provider, /model, /effort, /reset, /exit).
-`, defaultBaseURL, defaultOpenRouterBaseURL, defaultDeepSeekBaseURL, defaultOpenAIBaseURL, defaultCodexBaseURL)
+`, defaultBaseURL, defaultOpenRouterBaseURL, defaultDeepSeekBaseURL, defaultOpenAIBaseURL, defaultInceptronBaseURL, defaultCodexBaseURL)
 	}
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -303,7 +305,7 @@ func handleSlash(sess *session, line string, report progressFunc) (handled, exit
 		report("conversation reset")
 	case "/help":
 		report(`Prompts go straight to the model. Commands:
-  /provider [name]   show or switch backend (anthropic, openrouter, deepseek, openai, codex); switching saves provider and model as the default for next launch and keeps history
+  /provider [name]   show or switch backend (anthropic, openrouter, deepseek, openai, inceptron, codex); switching saves provider and model as the default for next launch and keeps history
   /model [id]        show or set the model id (saved as default)
   /effort [level]    show or set reasoning effort: low, medium, high, default (saved as default; sent to all backends)
   /reset             clear conversation history
@@ -363,10 +365,12 @@ func defaultModelFor(provider string) (string, error) {
 		return defaultDeepSeekModel, nil
 	case "openai":
 		return defaultOpenAIModel, nil
+	case "inceptron":
+		return defaultInceptronModel, nil
 	case "codex":
 		return defaultCodexModel, nil
 	default:
-		return "", fmt.Errorf("unknown provider %q — use anthropic, openrouter, deepseek, openai or codex", provider)
+		return "", fmt.Errorf("unknown provider %q — use anthropic, openrouter, deepseek, openai, inceptron or codex", provider)
 	}
 }
 
@@ -399,6 +403,12 @@ func buildSender(provider, keyFlag string) (messageSender, error) {
 			return nil, fmt.Errorf("missing API key — set OPENAI_API_KEY or pass -key")
 		}
 		return newOpenAIClient(key, envOr("OPENAI_BASE_URL", defaultOpenAIBaseURL)), nil
+	case "inceptron":
+		key := firstNonEmpty(keyFlag, os.Getenv("INCEPTRON_API_KEY"))
+		if key == "" {
+			return nil, fmt.Errorf("missing API key — set INCEPTRON_API_KEY or pass -key")
+		}
+		return newInceptronClient(key, envOr("INCEPTRON_BASE_URL", defaultInceptronBaseURL)), nil
 	case "codex":
 		authPath, err := codexAuthPath()
 		if err != nil {

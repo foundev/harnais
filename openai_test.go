@@ -332,6 +332,18 @@ func TestResolveBackend(t *testing.T) {
 		t.Errorf("unexpected openai default model %q", model)
 	}
 
+	t.Setenv("INCEPTRON_API_KEY", "inc")
+	sender, model, err = resolveBackend("inceptron", "", "")
+	if err != nil {
+		t.Fatalf("inceptron: %v", err)
+	}
+	if _, ok := sender.(*openAICompatClient); !ok {
+		t.Errorf("expected *openAICompatClient, got %T", sender)
+	}
+	if model != defaultInceptronModel {
+		t.Errorf("unexpected inceptron default model %q", model)
+	}
+
 	t.Setenv("DEEPSEEK_API_KEY", "")
 	if _, _, err := resolveBackend("deepseek", "", ""); err == nil {
 		t.Error("expected missing-key error for deepseek")
@@ -339,6 +351,10 @@ func TestResolveBackend(t *testing.T) {
 	t.Setenv("OPENAI_API_KEY", "")
 	if _, _, err := resolveBackend("openai", "", ""); err == nil {
 		t.Error("expected missing-key error for openai")
+	}
+	t.Setenv("INCEPTRON_API_KEY", "")
+	if _, _, err := resolveBackend("inceptron", "", ""); err == nil {
+		t.Error("expected missing-key error for inceptron")
 	}
 	if _, _, err := resolveBackend("nope", "k", "m"); err == nil {
 		t.Error("expected error for unknown provider")

@@ -30,6 +30,11 @@ const defaultOpenAIBaseURL = "https://api.openai.com/v1"
 // defaultOpenAIModel applies when -model is unset with -provider=openai.
 const defaultOpenAIModel = "gpt-5-mini"
 
+const defaultInceptronBaseURL = "https://api.inceptron.io/v1"
+
+// defaultInceptronModel applies when -model is unset with -provider=inceptron.
+const defaultInceptronModel = "zai-org/GLM-5.3"
+
 // openAICompatClient speaks OpenAI-style /chat/completions, shared by the
 // OpenRouter, DeepSeek, and OpenAI backends. Translation to and from the
 // harness message shape lives in toChatRequest / decodeChatResponse.
@@ -67,6 +72,15 @@ func newDeepSeekClient(apiKey, baseURL string) *openAICompatClient {
 }
 
 func newOpenAIClient(apiKey, baseURL string) *openAICompatClient {
+	return &openAICompatClient{
+		http:    &http.Client{Timeout: 180 * time.Second},
+		apiKey:  apiKey,
+		baseURL: baseURL,
+		retry:   defaultRetryPolicy(),
+	}
+}
+
+func newInceptronClient(apiKey, baseURL string) *openAICompatClient {
 	return &openAICompatClient{
 		http:    &http.Client{Timeout: 180 * time.Second},
 		apiKey:  apiKey,
