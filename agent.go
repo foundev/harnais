@@ -41,6 +41,13 @@ type messageSender interface {
 	createMessage(ctx context.Context, req messageRequest) (*messageResponse, error)
 }
 
+// modelLister is the optional backend capability behind /models and TAB
+// completion: the model IDs its list endpoint returns. Backends without
+// one (codex) simply don't implement it.
+type modelLister interface {
+	listModels(ctx context.Context) ([]string, error)
+}
+
 // progressFunc reports agent activity to the user.
 type progressFunc func(format string, args ...any)
 

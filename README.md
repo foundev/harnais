@@ -66,6 +66,12 @@ export INCEPTRON_API_KEY=...
 harnais -provider=inceptron "explain what main.go does"
 ```
 
+Its GLM models are reasoning models: they can think past 8k output tokens
+before the first visible character, so for this backend a `-max-tokens`
+cap is left off by default and the backend decides (every other backend
+still defaults to 8192). Truncated responses expose their chain of
+thought as `message.reasoning`, which the harness surfaces as text.
+
 Or bill your ChatGPT subscription through the Codex login you already have —
 no API key needed. Auth is Codex's job (`codex login` / `codex logout`);
 harnais only reads `~/.codex/auth.json` (or `$CODEX_HOME/auth.json`),
@@ -95,10 +101,17 @@ Session commands:
 ```sh
 anthropic> /provider openrouter   # switch backend, saved as default (model resets, history kept)
 anthropic> /model my-model        # use a different model id, saved as default
+anthropic> /models                # list the backend's available model ids
 anthropic> /effort high           # reasoning effort (low, medium, high, default), saved as default
 anthropic> /reset                 # clear history
 anthropic> /exit                  # leave
 ```
+
+On a terminal the session reads lines with basic editing (backspace,
+^U, ^W) and TAB completion: slash commands on `/`, provider names after
+`/provider `, effort levels after `/effort `, and the backend's live
+model list after `/model ` (fetched from the backend's models endpoint
+and cached per provider; ^C clears the line or leaves on an empty one).
 
 Provider, model, and effort persist in `$XDG_CONFIG_HOME/harnais/config.json`
 (`~/.config/harnais/config.json` by default), so the next launch —
@@ -118,7 +131,7 @@ override the saved values for one run without changing them.
 | `-key`         | per-provider env var           | API key                                        |
 | `-effort`      | saved, else `""`               | Reasoning effort for this run: `low`, `medium`, `high` (all backends) |
 | `-n`           | `25`                           | Max agent iterations per prompt                |
-| `-max-tokens`  | `8192`                         | Max tokens per model response                  |
+| `-max-tokens`  | `0`                            | Max tokens per model response; 0 = provider default (8192, uncapped for inceptron) |
 | `-no-sandbox`  | `false`                        | Run `bash` without the OS sandbox              |
 | `-system`      | `""`                           | Extra system instructions                      |
 | `-version`     | —                              | Print version and exit                         |
@@ -147,7 +160,7 @@ for `-provider=deepseek`, `gpt-5-mini` for `-provider=openai`,
 | `CODEX_BASE_URL`     | Codex backend root (default `https://chatgpt.com/backend-api/codex`) |
 | `HARNAIS_DEBUG`      | When set to a file path, appends Codex request/response bodies there (never tokens) |
 
-In a session, `/help` lists the slash commands (`/provider`, `/model`, `/effort`, `/reset`, `/exit`).
+In a session, `/help` lists the slash commands (`/provider`, `/model`, `/models`, `/effort`, `/reset`, `/exit`).
 
 ## Review
 
@@ -201,6 +214,7 @@ unsandboxed with a one-time warning
 - `anthropic.go` — minimal Messages API client (`net/http` + `encoding/json`)
 - `openai.go` — OpenAI-compatible client (OpenRouter, DeepSeek, OpenAI, Inceptron) translated onto the same loop
 - `codex.go` — Codex subscription backend: reuses the Codex CLI login, speaks the Responses API
+- `edit.go` — raw-mode line editor with TAB completion for the interactive REPL
 - `tools.go` — the four tool implementations
 - `tools_test.go` — tool tests (`go test ./...`)
 

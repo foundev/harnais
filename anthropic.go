@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"sort"
 	"time"
 )
 
@@ -158,4 +160,66 @@ func (c *anthropicClient) do(httpReq *http.Request) (int, []byte, error) {
 		return 0, nil, fmt.Errorf("read response: %w", err)
 	}
 	return resp.StatusCode, raw, nil
+}
+
+// anthropicModelsPage is one page of GET /v1/models output.
+type anthropicModelsPage struct {
+	Data []struct {
+		ID string `json:"id"`
+	} `json:"data"`
+	HasMore bool   `json:"has_more"`
+	LastID  string `json:"last_id"`
+}
+
+// decodeAnthropicModelsPage extracts one page's IDs plus the pagination
+// cursor. Pure so the mapping stays testable without network.
+func decodeAnthropicModelsPage(raw []byte) (ids []string, lastID string, hasMore bool, err error) {
+	var page anthropicModelsPage
+	if err := json.Unmarshal(raw, &page); err != nil {
+		return nil, "", false, fmt.Errorf("decode models: %w", err)
+	}
+	for _, m := range page.Data {
+		if m.ID != "" {
+			ids = append(ids, m.ID)
+		}
+	}
+	return ids, page.LastID, page.HasMore, nil
+}
+
+// listModels fetches the backend's model IDs for /models and TAB
+// completion (see main.go), following the cursor until the pages run out
+// (bounded: a broken has_more loop must not spin forever).
+func (c *anthropicClient) listModels(ctx context.Context) ([]string, error) {
+	var ids []string
+	afterID := ""
+	for page := 0; ; page++ {
+		u := c.baseURL + "/v1/models?limit=100"
+		if afterID != "" {
+			u += "&after_id=" + url.QueryEscape(afterID)
+		}
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+		if err != nil {
+			return nil, fmt.Errorf("build request: %w", err)
+		}
+		httpReq.Header.Set("X-Api-Key", c.apiKey)
+		httpReq.Header.Set("Anthropic-Version", anthropicVersion)
+		status, raw, err := c.do(httpReq)
+		if err != nil {
+			return nil, err
+		}
+		if status < 200 || status >= 300 {
+			return nil, fmt.Errorf("api error %d: %s", status, truncateOutput(string(raw)))
+		}
+		pageIDs, lastID, hasMore, err := decodeAnthropicModelsPage(raw)
+		if err != nil {
+			return nil, err
+		}
+		ids = append(ids, pageIDs...)
+		if !hasMore || lastID == "" || page >= 4 {
+			break
+		}
+		afterID = lastID
+	}
+	sort.Strings(ids)
+	return ids, nil
 }

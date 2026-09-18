@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"time"
 )
@@ -49,6 +50,12 @@ type openAICompatClient struct {
 	// whenever tools are in play (400 otherwise) and ignores it
 	// without tools; other backends must not receive the field.
 	echoReasoning bool
+	// readReasoningField decodes message.reasoning — Inceptron's GLM
+	// models put their chain of thought there (where DeepSeek-style
+	// endpoints use reasoning_content) and a length-truncated response
+	// can hold nothing else. Inceptron-only: other backends must not
+	// gain a phantom text fallback.
+	readReasoningField bool
 }
 
 func newOpenRouterClient(apiKey, baseURL string) *openAICompatClient {
@@ -82,10 +89,11 @@ func newOpenAIClient(apiKey, baseURL string) *openAICompatClient {
 
 func newInceptronClient(apiKey, baseURL string) *openAICompatClient {
 	return &openAICompatClient{
-		http:    &http.Client{Timeout: 180 * time.Second},
-		apiKey:  apiKey,
-		baseURL: baseURL,
-		retry:   defaultRetryPolicy(),
+		http:               &http.Client{Timeout: 180 * time.Second},
+		apiKey:             apiKey,
+		baseURL:            baseURL,
+		retry:              defaultRetryPolicy(),
+		readReasoningField: true,
 	}
 }
 
@@ -128,13 +136,13 @@ func (c *openAICompatClient) createMessage(ctx context.Context, req messageReque
 			continue
 		}
 		if c.retry.retryableStatus(status) && attempt < c.retry.maxAttempts {
-			_, lastErr = decodeChatResponse(status, raw)
+			_, lastErr = decodeChatResponse(status, raw, c.readReasoningField)
 			if serr := sleepRetry(ctx, c.retry.delayFor(attempt+1)); serr != nil {
 				return nil, lastErr
 			}
 			continue
 		}
-		return decodeChatResponse(status, raw)
+		return decodeChatResponse(status, raw, c.readReasoningField)
 	}
 }
 
@@ -152,8 +160,9 @@ func (c *openAICompatClient) do(httpReq *http.Request) (int, []byte, error) {
 }
 
 // decodeChatResponse maps an OpenAI-style chat completion onto the harness
-// message shape. Pure function so the mapping is testable without network.
-func decodeChatResponse(status int, raw []byte) (*messageResponse, error) {
+// message shape. Pure function so the mapping is testable without network;
+// readReasoningField enables the Inceptron-only message.reasoning fallback.
+func decodeChatResponse(status int, raw []byte, readReasoningField bool) (*messageResponse, error) {
 	if status < 200 || status >= 300 {
 		return nil, fmt.Errorf("api error %d: %s", status, truncateOutput(string(raw)))
 	}
@@ -167,7 +176,7 @@ func decodeChatResponse(status int, raw []byte) (*messageResponse, error) {
 	if len(chat.Choices) == 0 {
 		return nil, fmt.Errorf("api error: response had no choices")
 	}
-	resp := fromChatChoice(chat.Choices[0], chat.ID, chat.Usage.PromptTokens, chat.Usage.CompletionTokens)
+	resp := fromChatChoice(chat.Choices[0], chat.ID, chat.Usage.PromptTokens, chat.Usage.CompletionTokens, readReasoningField)
 	if len(resp.Content) == 0 {
 		// An empty end_turn would otherwise surface as a blank answer
 		// with no error. Fail loudly, naming the finish reason so a
@@ -186,9 +195,12 @@ type chatMessage struct {
 	// ReasoningContent carries DeepSeek thinking-mode reasoning. Read off
 	// every response; sent back on assistant messages only by backends
 	// that require it (DeepSeek with tools), never otherwise.
-	ReasoningContent string         `json:"reasoning_content,omitempty"`
-	ToolCalls        []chatToolCall `json:"tool_calls,omitempty"`
-	ToolCallID       string         `json:"tool_call_id,omitempty"`
+	ReasoningContent string `json:"reasoning_content,omitempty"`
+	// Reasoning carries Inceptron's chain of thought. Read off responses
+	// by the inceptron backend only (see readReasoningField); never sent.
+	Reasoning  string         `json:"reasoning,omitempty"`
+	ToolCalls  []chatToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string         `json:"tool_call_id,omitempty"`
 }
 
 type chatToolCall struct {
@@ -334,7 +346,7 @@ func toChatRequest(req messageRequest, echoReasoning bool) chatRequest {
 func fromChatChoice(choice struct {
 	Message      chatMessage `json:"message"`
 	FinishReason string      `json:"finish_reason"`
-}, id string, promptTokens, completionTokens int) *messageResponse {
+}, id string, promptTokens, completionTokens int, readReasoningField bool) *messageResponse {
 	resp := &messageResponse{ID: id}
 	text := choice.Message.Content
 	if strings.TrimSpace(text) == "" {
@@ -342,6 +354,12 @@ func fromChatChoice(choice struct {
 		// reasoning_content with an empty content; prefer it over an
 		// empty final answer so the turn still carries text.
 		text = choice.Message.ReasoningContent
+		// Inceptron's GLM models expose the chain of thought as
+		// message.reasoning instead, and a length-truncated response
+		// can hold nothing else — same fallback, that backend only.
+		if readReasoningField && strings.TrimSpace(text) == "" {
+			text = choice.Message.Reasoning
+		}
 	}
 	if text != "" {
 		resp.Content = append(resp.Content, contentBlock{Type: "text", Text: text})
@@ -402,4 +420,48 @@ func splitContent(raw json.RawMessage) (string, []contentBlock) {
 		return joined, rest
 	}
 	return "", nil
+}
+
+// modelsList is the OpenAI-style GET /models response shared by the
+// OpenAI-compatible backends (OpenAI, OpenRouter, DeepSeek, Inceptron).
+type modelsList struct {
+	Data []struct {
+		ID string `json:"id"`
+	} `json:"data"`
+}
+
+// decodeModelsList extracts the sorted, non-empty model IDs. Pure so the
+// mapping stays testable without network.
+func decodeModelsList(raw []byte) ([]string, error) {
+	var list modelsList
+	if err := json.Unmarshal(raw, &list); err != nil {
+		return nil, fmt.Errorf("decode models: %w", err)
+	}
+	var ids []string
+	for _, m := range list.Data {
+		if m.ID != "" {
+			ids = append(ids, m.ID)
+		}
+	}
+	sort.Strings(ids)
+	return ids, nil
+}
+
+// listModels fetches the backend's model IDs for /models and TAB
+// completion (see main.go). Inceptron's endpoint is public; the rest
+// require the usual Authorization header.
+func (c *openAICompatClient) listModels(ctx context.Context) ([]string, error) {
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/models", nil)
+	if err != nil {
+		return nil, fmt.Errorf("build request: %w", err)
+	}
+	httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+	status, raw, err := c.do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	if status < 200 || status >= 300 {
+		return nil, fmt.Errorf("api error %d: %s", status, truncateOutput(string(raw)))
+	}
+	return decodeModelsList(raw)
 }

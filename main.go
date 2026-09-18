@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 const version = "0.1.0"
@@ -24,7 +25,7 @@ func run(args []string) int {
 	model := fs.String("model", envOr("ANTHROPIC_MODEL", ""), "Model ID (default depends on the saved provider).")
 	printMode := fs.String("p", "", "Run one non-interactive prompt and exit, e.g. -p \"fix the failing test\" (so flags can follow the prompt).")
 	apiKey := fs.String("key", "", "API key (not used by the codex backend, which reads the Codex login).")
-	maxTokens := fs.Int("max-tokens", 8192, "Max tokens per model response.")
+	maxTokens := fs.Int("max-tokens", 0, "Max tokens per model response (0 = the provider default; see -provider).")
 	effort := fs.String("effort", "", "Reasoning effort: low, medium or high (sent to all backends).")
 	maxIters := fs.Int("n", 25, "Max agent iterations per prompt.")
 	noSandbox := fs.Bool("no-sandbox", false, "Run bash without the OS sandbox (macOS Seatbelt).")
@@ -57,7 +58,7 @@ Environment:
   CODEX_HOME           Directory holding Codex auth.json (default ~/.codex).
   CODEX_BASE_URL       Codex backend root (default %s).
 
-In a session, type /help for slash commands (/provider, /model, /effort, /reset, /exit).
+In a session, type /help for slash commands (/provider, /model, /models, /effort, /reset, /exit).
 `, defaultBaseURL, defaultOpenRouterBaseURL, defaultDeepSeekBaseURL, defaultOpenAIBaseURL, defaultInceptronBaseURL, defaultCodexBaseURL)
 	}
 	if err := fs.Parse(args); err != nil {
@@ -96,7 +97,7 @@ In a session, type /help for slash commands (/provider, /model, /effort, /reset,
 	cfg := config{
 		// Flags win for this run; the saved triple is the default.
 		model:       firstNonEmpty(*model, stored.Model, defModel),
-		maxTokens:   *maxTokens,
+		maxTokens:   firstNonZero(*maxTokens, defaultMaxTokens(provider)),
 		maxIters:    *maxIters,
 		extraSystem: *extraSystem,
 		effort:      firstNonEmpty(*effort, stored.Effort),
@@ -133,7 +134,7 @@ In a session, type /help for slash commands (/provider, /model, /effort, /reset,
 	// Sessions start without touching any credential: the backend is built
 	// lazily on the first prompt (or eagerly by /provider), so no key is
 	// needed just to open the REPL.
-	sess := &session{provider: provider, cfg: cfg, keyFlag: *apiKey, configPath: cfgPath}
+	sess := &session{provider: provider, cfg: cfg, keyFlag: *apiKey, maxTokensFlag: *maxTokens, configPath: cfgPath}
 	return repl(ctx, sess, in, report)
 }
 
@@ -246,6 +247,13 @@ type session struct {
 	// keyFlag is the startup -key, used for the initial backend only;
 	// switching providers falls back to environment credentials.
 	keyFlag string
+	// maxTokensFlag is the raw startup -max-tokens (0 = provider
+	// default), kept so /provider can re-resolve the cap per backend.
+	maxTokensFlag int
+	// modelIDs caches the backend's model list for /models and TAB
+	// completion; modelsLoaded marks a completed fetch (possibly empty).
+	modelIDs     []string
+	modelsLoaded bool
 	// configPath persists /provider switches; "" disables persistence.
 	configPath string
 }
@@ -306,7 +314,8 @@ func handleSlash(sess *session, line string, report progressFunc) (handled, exit
 	case "/help":
 		report(`Prompts go straight to the model. Commands:
   /provider [name]   show or switch backend (anthropic, openrouter, deepseek, openai, inceptron, codex); switching saves provider and model as the default for next launch and keeps history
-  /model [id]        show or set the model id (saved as default)
+  /model [id]        show or set the model id (saved as default; TAB completes from the backend's list)
+  /models            list the backend's available model ids
   /effort [level]    show or set reasoning effort: low, medium, high, default (saved as default; sent to all backends)
   /reset             clear conversation history
   /exit              leave`)
@@ -323,7 +332,10 @@ func handleSlash(sess *session, line string, report progressFunc) (handled, exit
 		sess.sender = sender
 		sess.provider = fields[1]
 		sess.cfg.model = model
+		sess.cfg.maxTokens = firstNonZero(sess.maxTokensFlag, defaultMaxTokens(sess.provider))
 		sess.keyFlag = ""
+		// The new backend has its own model list; drop the cache.
+		sess.modelIDs, sess.modelsLoaded = nil, false
 		persistSession(sess, report, fmt.Sprintf("provider: %s, model reset to %s (history kept)", sess.provider, model))
 	case "/model":
 		if len(fields) < 2 {
@@ -332,6 +344,24 @@ func handleSlash(sess *session, line string, report progressFunc) (handled, exit
 		}
 		sess.cfg.model = fields[1]
 		persistSession(sess, report, fmt.Sprintf("model: %s", sess.cfg.model))
+	case "/models":
+		// handleSlash has no caller context; a short private one keeps a
+		// dead backend from hanging the REPL on this command.
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		ids, err := availableModelIDs(ctx, sess)
+		if err != nil {
+			report("%s", paint(ansiYellow, fmt.Sprintf("model list unavailable: %v", err)))
+			break
+		}
+		if len(ids) == 0 {
+			report("%s", paint(ansiYellow, "the backend returned no models"))
+			break
+		}
+		report("available models (%d):", len(ids))
+		for _, id := range ids {
+			report("  %s", id)
+		}
 	case "/effort":
 		if len(fields) < 2 {
 			report("effort: %s (sent to all backends)", describeEffort(sess))
@@ -372,6 +402,86 @@ func defaultModelFor(provider string) (string, error) {
 	default:
 		return "", fmt.Errorf("unknown provider %q — use anthropic, openrouter, deepseek, openai, inceptron or codex", provider)
 	}
+}
+
+// defaultMaxTokens is the per-provider -max-tokens default (the flag's 0
+// means "provider default"). 8192 everywhere except inceptron: its GLM
+// models are reasoning models that can think past 8k tokens before the
+// first visible output character, and capping them truncates the turn to
+// a bare finish_reason "length" error — so the backend decides instead.
+func defaultMaxTokens(provider string) int {
+	if provider == "inceptron" {
+		return 0 // omit max_tokens; the backend decides
+	}
+	return 8192
+}
+
+// availableModelIDs lists the backend's model IDs for /models and TAB
+// completion, fetching once per provider and caching on the session. A
+// failed fetch stays uncached so the next attempt can retry; a backend
+// without a list endpoint caches as empty so it is not re-asked.
+func availableModelIDs(ctx context.Context, sess *session) ([]string, error) {
+	if sess.modelsLoaded {
+		return sess.modelIDs, nil
+	}
+	if err := ensureSender(sess); err != nil {
+		return nil, err
+	}
+	lister, ok := sess.sender.(modelLister)
+	if !ok {
+		sess.modelIDs, sess.modelsLoaded = nil, true
+		return nil, fmt.Errorf("the %s backend has no model list endpoint", sess.provider)
+	}
+	ids, err := lister.listModels(ctx)
+	if err != nil {
+		return nil, err
+	}
+	sess.modelIDs, sess.modelsLoaded = ids, true
+	return ids, nil
+}
+
+// slashCommands, providerNames, and effortLevels feed TAB completion.
+var (
+	slashCommands = []string{"/effort", "/exit", "/help", "/model", "/models", "/provider", "/quit", "/reset"}
+	providerNames = []string{"anthropic", "codex", "deepseek", "inceptron", "openai", "openrouter"}
+	effortLevels  = []string{"default", "high", "low", "medium"}
+)
+
+// replCompleter serves TAB completion in the interactive editor: slash
+// commands on the first word, then per-command values — provider names,
+// effort levels, and the backend's live model IDs after /model.
+func replCompleter(ctx context.Context, sess *session) func(line string) []string {
+	return func(line string) []string {
+		if !strings.HasPrefix(line, "/") {
+			return nil
+		}
+		if !strings.Contains(line, " ") {
+			return filterPrefix(slashCommands, line)
+		}
+		cmd, _, _ := strings.Cut(line, " ")
+		word := line[strings.LastIndexByte(line, ' ')+1:]
+		switch cmd {
+		case "/provider":
+			return filterPrefix(providerNames, word)
+		case "/model":
+			ids, _ := availableModelIDs(ctx, sess)
+			return filterPrefix(ids, word)
+		case "/effort":
+			return filterPrefix(effortLevels, word)
+		}
+		return nil
+	}
+}
+
+// filterPrefix keeps the candidates a word prefix matches, nil when none.
+func filterPrefix(cands []string, prefix string) []string {
+	var out []string
+	for _, c := range cands {
+		if strings.HasPrefix(c, prefix) {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // buildSender constructs the backend client, requiring its credential.
@@ -447,14 +557,41 @@ func firstNonEmpty(vals ...string) string {
 	return ""
 }
 
+func firstNonZero(vals ...int) int {
+	for _, v := range vals {
+		if v != 0 {
+			return v
+		}
+	}
+	return 0
+}
+
 func repl(ctx context.Context, sess *session, in *bufio.Reader, report progressFunc) int {
 	report("harnais %s — %s (type /help for commands)", version, paint(ansiCyan, sess.provider+"/"+sess.cfg.model))
+	// Line editing with TAB completion needs both ends on the terminal:
+	// keystrokes from stdin, echo to stderr. Pipes and tests keep the
+	// plain bufio path.
+	interactive := isTerminal(os.Stdin) && isTerminal(os.Stderr)
+	var completeFn func(string) []string
+	if interactive {
+		completeFn = replCompleter(ctx, sess)
+	}
 	for {
-		fmt.Fprintf(os.Stderr, "%s", paint(ansiBoldCyan, sess.provider+"> "))
-		line, err := in.ReadString('\n')
-		if err != nil {
-			fmt.Fprintln(os.Stderr)
-			return 0
+		var line string
+		if interactive {
+			edited, exit := readLineEdited(paint(ansiBoldCyan, sess.provider+"> "), completeFn)
+			if exit {
+				return 0
+			}
+			line = edited
+		} else {
+			fmt.Fprintf(os.Stderr, "%s", paint(ansiBoldCyan, sess.provider+"> "))
+			raw, err := in.ReadString('\n')
+			if err != nil {
+				fmt.Fprintln(os.Stderr)
+				return 0
+			}
+			line = raw
 		}
 		prompt := strings.TrimSpace(line)
 		if prompt == "" {

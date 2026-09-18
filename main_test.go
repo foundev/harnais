@@ -266,3 +266,125 @@ func TestSlashResetUnknownExit(t *testing.T) {
 		t.Errorf("/exit should exit: %v %v", handled, exit)
 	}
 }
+
+// fakeListerSender extends fakeSender with a model list, standing in for
+// a backend that implements modelLister.
+type fakeListerSender struct {
+	fakeSender
+	ids   []string
+	calls int
+}
+
+func (f *fakeListerSender) listModels(_ context.Context) ([]string, error) {
+	f.calls++
+	return f.ids, nil
+}
+
+func TestSlashModelsCommand(t *testing.T) {
+	sess := &session{
+		sender:   &fakeListerSender{ids: []string{"zai-org/GLM-5.3", "zai-org/GLM-5.2"}},
+		provider: "inceptron",
+		cfg:      config{model: "zai-org/GLM-5.3", maxIters: 1},
+	}
+	report, got := slashReporter()
+	handleSlash(sess, "/models", report)
+	joined := strings.Join(*got, "\n")
+	if !strings.Contains(joined, "zai-org/GLM-5.2") || !strings.Contains(joined, "zai-org/GLM-5.3") {
+		t.Errorf("/models must list ids: %q", joined)
+	}
+	// The fetch caches: a second /models does not refetch.
+	handleSlash(sess, "/models", report)
+	if sess.sender.(*fakeListerSender).calls != 1 {
+		t.Errorf("model list must be fetched once, got %d calls", sess.sender.(*fakeListerSender).calls)
+	}
+
+	// A backend without a list endpoint reports instead of hanging.
+	sess = &session{sender: &fakeSender{}, provider: "codex", cfg: config{model: "m"}}
+	report, got = slashReporter()
+	handleSlash(sess, "/models", report)
+	if !strings.Contains(lastReport(t, got), "unavailable") {
+		t.Errorf("missing list endpoint must report: %q", lastReport(t, got))
+	}
+
+	// No credential yet: same report path, no panic.
+	sess = &session{provider: "anthropic", cfg: config{model: "m"}}
+	report, got = slashReporter()
+	handleSlash(sess, "/models", report)
+	if !strings.Contains(lastReport(t, got), "unavailable") {
+		t.Errorf("missing credential must report: %q", lastReport(t, got))
+	}
+}
+
+func TestProviderSwitchInvalidatesModelCache(t *testing.T) {
+	t.Setenv("OPENROUTER_API_KEY", "ok")
+	t.Setenv("ANTHROPIC_API_KEY", "ak")
+	sess := newSlashSession(t)
+	sess.modelIDs, sess.modelsLoaded = []string{"stale"}, true
+	report, _ := slashReporter()
+	handleSlash(sess, "/provider openrouter", report)
+	if sess.modelsLoaded || sess.modelIDs != nil {
+		t.Errorf("switch must drop the model cache: loaded=%v ids=%v", sess.modelsLoaded, sess.modelIDs)
+	}
+	// Switching also re-resolves the per-provider max-tokens default.
+	sess.maxTokensFlag = 0
+	handleSlash(sess, "/provider inceptron", report)
+	if sess.cfg.maxTokens != 0 {
+		t.Errorf("inceptron must default to an uncapped budget, got %d", sess.cfg.maxTokens)
+	}
+	handleSlash(sess, "/provider anthropic", report)
+	if sess.cfg.maxTokens != 8192 {
+		t.Errorf("anthropic must default to 8192, got %d", sess.cfg.maxTokens)
+	}
+	// An explicit flag rides along across switches.
+	sess.maxTokensFlag = 4096
+	handleSlash(sess, "/provider inceptron", report)
+	if sess.cfg.maxTokens != 4096 {
+		t.Errorf("explicit -max-tokens must override the provider default, got %d", sess.cfg.maxTokens)
+	}
+}
+
+func TestDefaultMaxTokens(t *testing.T) {
+	if got := defaultMaxTokens("inceptron"); got != 0 {
+		t.Errorf("inceptron must be uncapped, got %d", got)
+	}
+	for _, p := range []string{"anthropic", "openrouter", "deepseek", "openai", "codex", "unknown"} {
+		if got := defaultMaxTokens(p); got != 8192 {
+			t.Errorf("%s must keep 8192, got %d", p, got)
+		}
+	}
+}
+
+func TestReplCompleter(t *testing.T) {
+	sess := &session{
+		sender:   &fakeListerSender{ids: []string{"zai-org/GLM-5.2", "zai-org/GLM-5.3", "moonshotai/Kimi-K2.6"}},
+		provider: "inceptron",
+		cfg:      config{model: "zai-org/GLM-5.3", maxIters: 1},
+	}
+	complete := replCompleter(context.Background(), sess)
+
+	if got := complete("/mo"); len(got) != 2 || got[0] != "/model" || got[1] != "/models" {
+		t.Errorf("command completion wrong: %v", got)
+	}
+	if got := complete("plain text"); got != nil {
+		t.Errorf("plain prompts must not complete: %v", got)
+	}
+	if got := complete("/provider inc"); len(got) != 1 || got[0] != "inceptron" {
+		t.Errorf("provider completion wrong: %v", got)
+	}
+	if got := complete("/effort h"); len(got) != 1 || got[0] != "high" {
+		t.Errorf("effort completion wrong: %v", got)
+	}
+	if got := complete("/model zai"); len(got) != 2 {
+		t.Errorf("model completion must use the backend list: %v", got)
+	}
+	if got := complete("/model moonshotai/"); len(got) != 1 || got[0] != "moonshotai/Kimi-K2.6" {
+		t.Errorf("full-prefix model completion wrong: %v", got)
+	}
+	if got := complete("/model nope"); got != nil {
+		t.Errorf("no matches must complete nothing: %v", got)
+	}
+	// The completion fetch populated the cache; further calls reuse it.
+	if sess.sender.(*fakeListerSender).calls != 1 {
+		t.Errorf("completions must share the /models cache, got %d calls", sess.sender.(*fakeListerSender).calls)
+	}
+}

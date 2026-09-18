@@ -61,7 +61,7 @@ func TestOpenRouterRequestTranslation(t *testing.T) {
 
 func TestOpenRouterResponseWithTools(t *testing.T) {
 	raw := []byte(`{"id":"gen_1","choices":[{"message":{"role":"assistant","content":"running","tool_calls":[{"id":"call_2","type":"function","function":{"name":"read","arguments":"{\"path\":\"main.go\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}`)
-	resp, err := decodeChatResponse(200, raw)
+	resp, err := decodeChatResponse(200, raw, false)
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}
@@ -104,7 +104,7 @@ func TestBuildChatRequestEffort(t *testing.T) {
 
 func TestOpenRouterResponseFinalText(t *testing.T) {
 	raw := []byte(`{"id":"gen_2","choices":[{"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
-	resp, err := decodeChatResponse(200, raw)
+	resp, err := decodeChatResponse(200, raw, false)
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}
@@ -179,7 +179,7 @@ func TestChatRequestEmptyToolResult(t *testing.T) {
 
 func TestChatResponseReasoningFallback(t *testing.T) {
 	raw := []byte(`{"id":"gen_3","choices":[{"message":{"role":"assistant","content":"","reasoning_content":"thinking trace"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
-	resp, err := decodeChatResponse(200, raw)
+	resp, err := decodeChatResponse(200, raw, false)
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}
@@ -221,7 +221,7 @@ func TestChatReasoningEchoDeepSeekOnly(t *testing.T) {
 
 func TestChatReasoningRoundTrip(t *testing.T) {
 	raw := []byte(`{"id":"gen_4","choices":[{"message":{"role":"assistant","content":"","reasoning_content":"checking tools","tool_calls":[{"id":"call_9","type":"function","function":{"name":"read","arguments":"{}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
-	resp, err := decodeChatResponse(200, raw)
+	resp, err := decodeChatResponse(200, raw, false)
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}
@@ -245,27 +245,27 @@ func TestChatReasoningRoundTrip(t *testing.T) {
 
 func TestChatEmptyResponseErrors(t *testing.T) {
 	raw := []byte(`{"id":"gen_5","choices":[{"message":{"role":"assistant","content":""},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
-	if _, err := decodeChatResponse(200, raw); err == nil ||
+	if _, err := decodeChatResponse(200, raw, false); err == nil ||
 		!strings.Contains(err.Error(), `finish_reason "stop"`) {
 		t.Errorf("empty stop must fail loudly, got %v", err)
 	}
 	raw = []byte(`{"id":"gen_6","choices":[{"message":{"role":"assistant","content":""},"finish_reason":"length"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
-	if _, err := decodeChatResponse(200, raw); err == nil ||
+	if _, err := decodeChatResponse(200, raw, false); err == nil ||
 		!strings.Contains(err.Error(), "max-tokens") {
 		t.Errorf("empty length cut must suggest raising max-tokens, got %v", err)
 	}
 }
 
 func TestOpenRouterResponseErrors(t *testing.T) {
-	if _, err := decodeChatResponse(401, []byte(`{"error":{"message":"bad key"}}`)); err == nil ||
+	if _, err := decodeChatResponse(401, []byte(`{"error":{"message":"bad key"}}`), false); err == nil ||
 		!strings.Contains(err.Error(), "401") {
 		t.Errorf("expected status error, got %v", err)
 	}
-	if _, err := decodeChatResponse(200, []byte(`{"error":{"message":"overloaded"}}`)); err == nil ||
+	if _, err := decodeChatResponse(200, []byte(`{"error":{"message":"overloaded"}}`), false); err == nil ||
 		!strings.Contains(err.Error(), "overloaded") {
 		t.Errorf("expected body error, got %v", err)
 	}
-	if _, err := decodeChatResponse(200, []byte(`{"id":"x","choices":[]}`)); err == nil {
+	if _, err := decodeChatResponse(200, []byte(`{"id":"x","choices":[]}`), false); err == nil {
 		t.Error("expected error for empty choices")
 	}
 }
@@ -358,5 +358,71 @@ func TestResolveBackend(t *testing.T) {
 	}
 	if _, _, err := resolveBackend("nope", "k", "m"); err == nil {
 		t.Error("expected error for unknown provider")
+	}
+}
+
+// TestInceptronReasoningFieldFallback guards the inceptron-only fallback:
+// GLM responses put the chain of thought in message.reasoning, and a
+// length-truncated one can hold nothing else. Other backends must not
+// gain the fallback.
+func TestInceptronReasoningFieldFallback(t *testing.T) {
+	raw := []byte(`{"id":"gen_7","choices":[{"message":{"role":"assistant","content":"","reasoning":"cut mid-thought"},"finish_reason":"length"}],"usage":{"prompt_tokens":1,"completion_tokens":8192}}`)
+	resp, err := decodeChatResponse(200, raw, true)
+	if err != nil {
+		t.Fatalf("truncated inceptron response must decode via reasoning, got %v", err)
+	}
+	if responseText(resp) != "cut mid-thought" {
+		t.Errorf("reasoning should back empty content, got %q", responseText(resp))
+	}
+	// Same body on a non-inceptron backend keeps the loud error.
+	if _, err := decodeChatResponse(200, raw, false); err == nil ||
+		!strings.Contains(err.Error(), "max-tokens") {
+		t.Errorf("other backends must not use the reasoning field, got %v", err)
+	}
+	// Content still wins when present.
+	raw = []byte(`{"id":"gen_8","choices":[{"message":{"role":"assistant","content":"answer","reasoning":"thinking"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+	resp, err = decodeChatResponse(200, raw, true)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if responseText(resp) != "answer" {
+		t.Errorf("content must win over reasoning, got %q", responseText(resp))
+	}
+}
+
+// TestInceptronClientFlags pins the client wiring: the inceptron backend
+// reads message.reasoning, the others do not.
+func TestInceptronClientFlags(t *testing.T) {
+	if !newInceptronClient("k", "http://x").readReasoningField {
+		t.Error("inceptron client must read the reasoning field")
+	}
+	for _, c := range []*openAICompatClient{
+		newOpenAIClient("k", "http://x"),
+		newOpenRouterClient("k", "http://x"),
+		newDeepSeekClient("k", "http://x"),
+	} {
+		if c.readReasoningField {
+			t.Errorf("%p must not read the reasoning field", c)
+		}
+	}
+}
+
+func TestDecodeModelsList(t *testing.T) {
+	ids, err := decodeModelsList([]byte(`{"data":[{"id":"zai-org/GLM-5.3"},{"id":"deepseek-ai/DeepSeek-V4-Flash-0731"},{"id":""},{"id":"zai-org/GLM-5.2"}]}`))
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	want := []string{"deepseek-ai/DeepSeek-V4-Flash-0731", "zai-org/GLM-5.2", "zai-org/GLM-5.3"}
+	if len(ids) != len(want) {
+		t.Fatalf("expected %d ids, got %v", len(want), ids)
+	}
+	for i := range want {
+		if ids[i] != want[i] {
+			t.Errorf("ids must be sorted and skip empties: got %v", ids)
+			break
+		}
+	}
+	if _, err := decodeModelsList([]byte(`{broken`)); err == nil {
+		t.Error("expected decode error for broken JSON")
 	}
 }
