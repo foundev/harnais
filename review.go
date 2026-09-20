@@ -70,8 +70,8 @@ func reviewerSystemPrompt() string {
 // caller to run this one call outside the OS sandbox.
 func reviewToolCall(ctx context.Context, sender messageSender, cfg config, history []message, tool string, input map[string]any) (approved, escalated bool, rationale string, err error) {
 	inputJSON, _ := json.Marshal(input)
-	user := fmt.Sprintf("Original task: %s\n\nProposed action: %s %s\n\nTranscript (most recent last):\n%s\n\nVerdict:",
-		reviewGoal(history), tool, inputJSON, renderTranscript(history))
+	user := fmt.Sprintf("Current task: %s\n\nProposed action: %s %s\n\nTranscript (most recent last):\n%s\n\nVerdict:",
+		reviewGoal(history, cfg.goal), tool, inputJSON, renderTranscript(history))
 	spin := startSpinner("reviewing")
 	resp, err := sender.createMessage(ctx, messageRequest{
 		Model:    cfg.model,
@@ -131,12 +131,19 @@ func splitVerdict(t, word string) (string, bool) {
 	return strings.TrimSpace(rest), true
 }
 
-// reviewGoal recovers the session's original task for the reviewer: the
-// first plain-text user message. Later turns accumulate tool traffic that
-// pushes the task out of the recent-transcript window, and tool-result
-// blocks never qualify (they don't decode as text). Falls back to
-// "(none stated)" when history holds no user text.
-func reviewGoal(history []message) string {
+// reviewGoal names the session's current task for the reviewer. Codex's
+// guardian reviewer retains every genuine user instruction out-of-band and
+// renders the whole lineage with "later instructions may revoke earlier
+// grants"; harnais gets the same effect from the transcript itself — the
+// history already holds every plain user prompt — so the section lists
+// them all in order. An explicit /goal objective replaces the section
+// entirely: it is the one stated task, and the goal-supersede notice that
+// shares the transcript would otherwise read as a change, not a task.
+func reviewGoal(history []message, explicit string) string {
+	if explicit = strings.TrimSpace(explicit); explicit != "" {
+		return compactGoalText(explicit)
+	}
+	var prompts []string
 	for _, msg := range history {
 		if msg.Role != "user" {
 			continue
@@ -148,12 +155,32 @@ func reviewGoal(history []message) string {
 		if text = strings.TrimSpace(text); text == "" {
 			continue
 		}
-		if len(text) > reviewTranscriptChars {
-			text = text[:reviewTranscriptChars] + "…"
+		// The goal-supersede notice is steering, not a user instruction;
+		// keeping it out stops framing that says "supersedes" without
+		// saying with what.
+		if strings.HasPrefix(text, goalNoticePrefix) {
+			continue
 		}
-		return strings.ReplaceAll(text, "\n", " / ")
+		prompts = append(prompts, compactGoalText(text))
 	}
-	return "(none stated)"
+	switch len(prompts) {
+	case 0:
+		return "(none stated)"
+	case 1:
+		return prompts[0]
+	default:
+		return "user instructions, in order (later ones supersede earlier ones):\n" +
+			strings.Join(prompts, "\n")
+	}
+}
+
+// compactGoalText flattens a goal to one bounded line for the reviewer
+// request.
+func compactGoalText(text string) string {
+	if len(text) > reviewTranscriptChars {
+		text = text[:reviewTranscriptChars] + "…"
+	}
+	return strings.ReplaceAll(text, "\n", " / ")
 }
 
 // renderTranscript condenses recent history for the reviewer: user and

@@ -16,6 +16,10 @@ type config struct {
 	// sandbox runs bash under the OS sandbox. Zero value off; run() sets
 	// it from --no-sandbox so production defaults to on.
 	sandbox bool
+	// goal is the session's explicit /goal objective, set by the user and
+	// pinned as the reviewer's task. While set, the turn loop continues
+	// (Codex's continue_if_idle) until the model calls update_goal.
+	goal string
 }
 
 func systemPrompt(extra string) string {
@@ -54,19 +58,34 @@ type progressFunc func(format string, args ...any)
 // plus the updated history. Mutating tool calls pass a reviewer agent first
 // (see review.go); reads run free. There is deliberately no human
 // confirmation step and no per-tool policy matrix.
+//
+// With an active goal (cfg.goal), the turn does not end when the model
+// stops asking for tools: like Codex's continue_if_idle, a continuation
+// turn seeded with the goal follows until the model calls update_goal with
+// "complete" or "blocked".
 func runPrompt(ctx context.Context, sender messageSender, cfg config, history []message, prompt string, report progressFunc) (string, []message, error) {
 	history = append(history, textMessage("user", prompt))
+	if cfg.goal != "" {
+		// The goal rides in the visible conversation, Codex-style: every
+		// turn (including continuations) sees what is being pursued.
+		history = append(history, textMessage("user", goalContinuationPrompt(&threadGoal{Objective: cfg.goal})))
+	}
 	consecutiveDenials := 0
-	// No step budget: the turn ends when the model stops asking for tools,
-	// which is the only stop a real task should hit. Codex works the same
-	// way — its sampling loop has no counter either.
+	// No step budget: the turn ends when the model stops asking for tools
+	// and — under an active goal — has not marked the goal done, which is
+	// the only stop a real task should hit. Codex works the same way — its
+	// sampling loop has no counter either.
 	for {
+		tools := toolDefinitions()
+		if cfg.goal != "" {
+			tools = append(tools, goalToolDefinition())
+		}
 		spin := startSpinner("thinking")
 		resp, err := sender.createMessage(ctx, messageRequest{
 			Model:    cfg.model,
 			System:   systemPrompt(cfg.extraSystem),
 			Messages: history,
-			Tools:    toolDefinitions(),
+			Tools:    tools,
 			Effort:   cfg.effort,
 		})
 		spin.finish()
@@ -77,10 +96,22 @@ func runPrompt(ctx context.Context, sender messageSender, cfg config, history []
 
 		if resp.StopReason != "tool_use" {
 			reportTruncation(resp.StopReason, report)
-			return responseText(resp), history, nil
+			if cfg.goal == "" {
+				return responseText(resp), history, nil
+			}
+			// Goal still active: re-seed and continue, Codex's
+			// continue_if_idle. The previous answer stays in history as
+			// context; the continuation prompt asks for real progress.
+			// A turn that ran no tools is the blocked audit's unit: the
+			// same impasse persisting for another consecutive turn.
+			goalBlockedTurns++
+			history = append(history, textMessage("user", goalContinuationPrompt(&threadGoal{Objective: cfg.goal})))
+			continue
 		}
 
 		var results []contentBlock
+		goalDone := ""
+		madeProgress := false
 		for _, block := range resp.Content {
 			if block.Type != "tool_use" {
 				continue
@@ -91,6 +122,30 @@ func runPrompt(ctx context.Context, sender messageSender, cfg config, history []
 					results = append(results, toolError(block.ID, fmt.Sprintf("invalid tool input: %v", err)))
 					continue
 				}
+			}
+			if block.Name == "update_goal" {
+				// The goal loop's only exit. Bookkeeping, not a mutation:
+				// no reviewer pass, no execution. "complete" always ends
+				// the loop; "blocked" is host-enforced like Codex's
+				// blocked audit — the same impasse must have survived at
+				// least goalTurnsToBlock consecutive goal turns, so the
+				// model cannot quit a hard goal after one bad turn. A
+				// premature call is rejected as a tool error and the
+				// loop continues.
+				status := strings.TrimSpace(strArg(input, "status"))
+				if status == "blocked" && goalBlockedTurns < goalTurnsToBlock {
+					results = append(results, toolError(block.ID,
+						fmt.Sprintf("blocked requires the same blocker across %d consecutive goal turns — only %d so far. Continue, or report concrete progress.", goalTurnsToBlock, goalBlockedTurns)))
+					report("%s", paint(ansiYellow, fmt.Sprintf("  goal: blocked rejected (%d/%d turns)", goalBlockedTurns, goalTurnsToBlock)))
+					continue
+				}
+				results = append(results, contentBlock{Type: "tool_result", ToolUseID: block.ID,
+					Content: "goal status recorded: " + status})
+				if goalFinished(status) {
+					goalDone = status
+				}
+				report("%s", paint(ansiGreen, fmt.Sprintf("  goal %s", status)))
+				continue
 			}
 			escalated := false
 			summary := summarizeInput(block.Name, input)
@@ -127,6 +182,7 @@ func runPrompt(ctx context.Context, sender messageSender, cfg config, history []
 					report("  review: approved — %s", firstLine(rationale))
 				}
 			}
+			before := fileContentBefore(block.Name, input)
 			out, err := executeToolSandboxed(ctx, block.Name, input, sandboxForCall(cfg.sandbox, block.Name, escalated))
 			consecutiveDenials = 0
 			if err != nil {
@@ -137,13 +193,41 @@ func runPrompt(ctx context.Context, sender messageSender, cfg config, history []
 				report("%s", paint(ansiRed, fmt.Sprintf("  error: %s", firstLine(err.Error()))))
 				continue
 			}
+			// A tool that actually ran is progress for the blocked audit:
+			// a genuine impasse runs no tools.
+			madeProgress = true
 			results = append(results, contentBlock{Type: "tool_result", ToolUseID: block.ID, Content: out})
 			report("  %s", firstLine(out))
+			// File diffs are terminal chrome for the user; the model
+			// keeps its plain tool result.
+			for _, line := range fileDiffLines(block.Name, input, before) {
+				report("  %s", line)
+			}
 		}
 		if len(results) == 0 {
 			return "", history, fmt.Errorf("model stopped for tool use but supplied no tool calls")
 		}
 		history = append(history, blocksMessage("user", results))
+		// The goal loop's exit: update_goal said complete/blocked, so the
+		// goal stops driving turns and the model's next end_turn returns
+		// normally — one last pass to summarize, no continuation. The
+		// audit streak ends with the goal: it must never leak into the
+		// next goal's blocked accounting.
+		if goalDone != "" {
+			cfg.goal = ""
+			goalBlockedTurns = 0
+		}
+		// Blocked audit, continued: a turn whose tools all failed also
+		// persists the impasse; any successful tool run resets the streak.
+		// (Turns that ended without tool calls were counted above.) A
+		// resolved goal skips both: cfg.goal is already clear.
+		if cfg.goal != "" {
+			if madeProgress {
+				goalBlockedTurns = 0
+			} else {
+				goalBlockedTurns++
+			}
+		}
 	}
 }
 
@@ -186,6 +270,35 @@ func summarizeInput(tool string, input map[string]any) string {
 		raw, _ := json.Marshal(input)
 		return string(raw)
 	}
+}
+
+// fileContentBefore snapshots the on-disk content an edit or write is
+// about to change so the diff shows what actually happened rather than
+// what the model intended. Unreadable or non-matching cases become "" —
+// for write that correctly reads as a new file, and a failed edit never
+// reaches the diff because it errors out.
+func fileContentBefore(tool string, input map[string]any) string {
+	if tool != "edit" && tool != "write" {
+		return ""
+	}
+	raw, err := os.ReadFile(strArg(input, "path"))
+	if err != nil {
+		return ""
+	}
+	return string(raw)
+}
+
+// fileDiffLines renders the change a completed edit or write made, nil for
+// tools that do not touch files.
+func fileDiffLines(tool string, input map[string]any, before string) []string {
+	if tool != "edit" && tool != "write" {
+		return nil
+	}
+	var after string
+	if raw, err := os.ReadFile(strArg(input, "path")); err == nil {
+		after = string(raw)
+	}
+	return renderFileDiff(strArg(input, "path"), before, after, colorsOn())
 }
 
 func firstLine(s string) string {

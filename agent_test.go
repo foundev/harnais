@@ -395,38 +395,98 @@ func TestReviewGoal(t *testing.T) {
 		}),
 		textMessage("user", "also update the footer"),
 	}
-	if got := reviewGoal(history); got != "fix the typo on the homepage" {
-		t.Errorf("goal must be the first user text, got %q", got)
+	// All plain user prompts are retained for the reviewer, in order —
+	// the goal-supersede notice is steering, not an instruction.
+	history = append(history, textMessage("user", goalUpdatedNotice("also update the footer")))
+	want := "user instructions, in order (later ones supersede earlier ones):\n" +
+		"fix the typo on the homepage\nalso update the footer"
+	if got := reviewGoal(history, ""); got != want {
+		t.Errorf("reviewer must retain every user instruction in order, got %q", got)
 	}
-	if got := reviewGoal(nil); got != "(none stated)" {
+	if got := reviewGoal(nil, ""); got != "(none stated)" {
 		t.Errorf("empty history needs a fallback, got %q", got)
 	}
+	if got := reviewGoal(history, "roll back the migration"); got != "roll back the migration" {
+		t.Errorf("an explicit /goal must win over history, got %q", got)
+	}
 	long := []message{textMessage("user", strings.Repeat("y", reviewTranscriptChars+10))}
-	if got := reviewGoal(long); len(got) > reviewTranscriptChars+10 {
+	if got := reviewGoal(long, ""); len(got) > reviewTranscriptChars+10 {
 		t.Errorf("goal must stay compact: %d bytes", len(got))
 	}
 }
 
-// TestReviewSeesOriginalTask verifies the reviewer request pins the session
-// goal even after tool traffic pushes it out of the transcript window.
-func TestReviewSeesOriginalTask(t *testing.T) {
+// TestReviewRetainsAllUserInstructions verifies the reviewer request keeps
+// every plain user prompt — including the original, after tool traffic has
+// pushed it out of the transcript window — in order, with the supersede
+// rule. Tool-result messages are blocks, not instructions, and the
+// goal-supersede notice is steering, so neither counts.
+func TestReviewRetainsAllUserInstructions(t *testing.T) {
 	history := []message{textMessage("user", "migrate the database")}
 	for i := 0; i < reviewTranscriptMessages+2; i++ {
-		history = append(history, textMessage("user", fmt.Sprintf("filler %d", i)))
+		history = append(history, blocksMessage("user", []contentBlock{
+			{Type: "tool_result", ToolUseID: fmt.Sprintf("c%d", i), Content: fmt.Sprintf("filler %d", i)},
+		}))
 	}
+	history = append(history, textMessage("user", "inventory the replicas"))
+	history = append(history, textMessage("user", goalUpdatedNotice("roll back the migration")))
+	history = append(history, textMessage("user", "roll back the migration now"))
 	sender := &fakeSender{t: t}
 	sender.script = func(call int, req messageRequest) messageResponse {
 		return reviewVerdictResponse("APPROVE: on task")
 	}
-	cfg := config{model: "test-model"}
+	cfg := config{model: "test-model", goal: "roll back the migration"}
 	approved, _, _, err := reviewToolCall(context.Background(), sender, cfg, history,
 		"bash", map[string]any{"command": "echo hi"})
 	if err != nil || !approved {
 		t.Fatalf("reviewToolCall = (%v, %v), want approval", approved, err)
 	}
 	blob := requestJSON(t, sender.requests[0])
-	if !strings.Contains(blob, "Original task: migrate the database") {
-		t.Errorf("review request must pin the session goal:\n%s", blob)
+	if !strings.Contains(blob, "Current task: roll back the migration") {
+		t.Errorf("explicit goal must pin the task line:\n%s", blob)
+	}
+	if strings.Contains(blob, "user instructions, in order") {
+		t.Errorf("an explicit goal replaces the instruction list:\n%s", blob)
+	}
+	// Without an explicit goal the retained list carries every prompt.
+	cfg.goal = ""
+	approved, _, _, err = reviewToolCall(context.Background(), sender, cfg, history,
+		"bash", map[string]any{"command": "echo hi"})
+	if err != nil || !approved {
+		t.Fatalf("reviewToolCall = (%v, %v), want approval", approved, err)
+	}
+	blob = requestJSON(t, sender.requests[1])
+	want := "user instructions, in order (later ones supersede earlier ones):\\n" +
+		"migrate the database\\ninventory the replicas\\nroll back the migration now"
+	if !strings.Contains(blob, want) {
+		t.Errorf("review request must retain all user instructions in order:\\n%s", blob)
+	}
+	// The notice stays visible in the transcript (the model saw it), but
+	// must not join the retained instruction list.
+	if strings.Contains(blob, "earlier ones):\\nmigrate the database\\nThe active session goal") {
+		t.Errorf("the goal-supersede notice must not join the instruction list:\\n%s", blob)
+	}
+}
+
+// TestReviewPrefersExplicitGoal verifies an explicit /goal objective pins
+// the reviewer's task even when older prompts surround it in history.
+func TestReviewPrefersExplicitGoal(t *testing.T) {
+	history := []message{textMessage("user", "migrate the database")}
+	sender := &fakeSender{t: t}
+	sender.script = func(call int, req messageRequest) messageResponse {
+		return reviewVerdictResponse("APPROVE: on task")
+	}
+	cfg := config{model: "test-model", goal: "roll back the migration"}
+	approved, _, _, err := reviewToolCall(context.Background(), sender, cfg, history,
+		"bash", map[string]any{"command": "echo hi"})
+	if err != nil || !approved {
+		t.Fatalf("reviewToolCall = (%v, %v), want approval", approved, err)
+	}
+	blob := requestJSON(t, sender.requests[0])
+	if !strings.Contains(blob, "Current task: roll back the migration") {
+		t.Errorf("review request must pin the explicit goal:\n%s", blob)
+	}
+	if strings.Contains(blob, "Current task: migrate the database") {
+		t.Errorf("an explicit goal must replace history-derived tasks:\n%s", blob)
 	}
 }
 
@@ -450,5 +510,241 @@ func TestRenderTranscript(t *testing.T) {
 	long := []message{textMessage("user", strings.Repeat("x", reviewTranscriptTotal+100))}
 	if got := renderTranscript(long); len(got) > reviewTranscriptTotal+reviewTranscriptChars {
 		t.Errorf("transcript must stay compact: %d bytes", len(got))
+	}
+}
+
+// TestGoalLoopContinuesUntilComplete verifies the Codex continue_if_idle
+// contract: with an active goal, an ended turn is followed by a
+// continuation seeded with the goal, and only update_goal with
+// complete/blocked ends the loop. The goal turn also advertises
+// update_goal and drops it once the loop exits.
+func TestGoalLoopContinuesUntilComplete(t *testing.T) {
+	sender := &fakeSender{t: t}
+	agentCalls := 0
+	sender.script = func(call int, req messageRequest) messageResponse {
+		if len(req.Tools) == 0 {
+			return reviewVerdictResponse("APPROVE: harmless")
+		}
+		agentCalls++
+		names := advertisedTools(req)
+		switch agentCalls {
+		case 1:
+			if !strings.Contains(names, "update_goal") {
+				t.Errorf("goal turn must advertise update_goal: %s", names)
+			}
+			return messageResponse{
+				ID: "msg_1",
+				Content: []contentBlock{
+					{Type: "text", Text: "halfway there"},
+					{Type: "tool_use", ID: "toolu_1", Name: "bash",
+						Input: json.RawMessage(`{"command":"echo progress"}`)},
+				},
+				StopReason: "tool_use",
+			}
+		case 2:
+			if !strings.Contains(names, "update_goal") {
+				t.Errorf("update_goal must stay advertised while the goal is active: %s", names)
+			}
+			return messageResponse{
+				ID: "msg_2", Content: []contentBlock{{Type: "text", Text: "turn over, but the goal is not done"}},
+				StopReason: "end_turn",
+			}
+		case 3:
+			// The continuation must carry the goal steering and the
+			// earlier answer, so the model sees where it left off.
+			blob := requestJSON(t, req)
+			if !strings.Contains(blob, "Continue working toward the active session goal") ||
+				!strings.Contains(blob, "turn over, but the goal is not done") {
+				t.Errorf("continuation missing goal steering or prior turn:\n%s", blob)
+			}
+			return messageResponse{
+				ID: "msg_3",
+				Content: []contentBlock{
+					{Type: "text", Text: "finished and verified"},
+					{Type: "tool_use", ID: "toolu_2", Name: "update_goal",
+						Input: json.RawMessage(`{"status":"complete"}`)},
+				},
+				StopReason: "tool_use",
+			}
+		default:
+			return messageResponse{
+				ID: "msg_4", Content: []contentBlock{{Type: "text", Text: "goal complete summary"}},
+				StopReason: "end_turn",
+			}
+		}
+	}
+	cfg := config{model: "test-model", goal: "ship the feature"}
+	answer, history, err := runPrompt(context.Background(), sender, cfg, nil, "start the work",
+		func(string, ...any) {})
+	if err != nil {
+		t.Fatalf("runPrompt: %v", err)
+	}
+	if answer != "goal complete summary" {
+		t.Fatalf("answer after update_goal = %q", answer)
+	}
+	if agentCalls != 4 {
+		t.Errorf("expected 4 agent model calls (tool, end, continuation+update_goal, summary), got %d", agentCalls)
+	}
+	if len(history) == 0 {
+		t.Fatal("history must be returned")
+	}
+}
+
+// TestGoalLoopBlockedAudit verifies Codex's blocked audit: update_goal
+// "blocked" is rejected by the host before the same impasse has survived
+// goalTurnsToBlock consecutive goal turns (a turn that ran no tools), and
+// accepted once it has. A successful tool run resets the counter.
+func TestGoalLoopBlockedAudit(t *testing.T) {
+	sender := &fakeSender{t: t}
+	agentCalls := 0
+	sender.script = func(call int, req messageRequest) messageResponse {
+		if len(req.Tools) == 0 {
+			return reviewVerdictResponse("APPROVE: harmless")
+		}
+		agentCalls++
+		blob := requestJSON(t, req)
+		if !strings.Contains(blob, "Continue working toward the active session goal") {
+			t.Errorf("goal steering must be present from the first turn")
+		}
+		switch agentCalls {
+		case 1: // impasse turn 1
+			return endTurn("stuck on the missing credentials")
+		case 2: // premature blocked — 1 < 3, rejected (the attempt is itself a no-progress turn)
+			return blockedCall()
+		case 3: // impasse turn 2; the rejection must be in context
+			if !strings.Contains(blob, "blocked requires the same blocker") {
+				t.Errorf("rejection must reach the model")
+			}
+			return endTurn("still stuck on the missing credentials")
+		case 4: // 3 >= 3: blocked is now accepted
+			return messageResponse{
+				ID: "msg_4",
+				Content: []contentBlock{
+					{Type: "text", Text: "cannot proceed"},
+					{Type: "tool_use", ID: "toolu_1", Name: "update_goal",
+						Input: json.RawMessage(`{"status":"blocked"}`)},
+				},
+				StopReason: "tool_use",
+			}
+		default: // summary after the loop exits
+			return endTurn("blocked summary")
+		}
+	}
+	cfg := config{model: "test-model", goal: "needs external credentials"}
+	answer, _, err := runPrompt(context.Background(), sender, cfg, nil, "go",
+		func(string, ...any) {})
+	if err != nil {
+		t.Fatalf("runPrompt: %v", err)
+	}
+	if answer != "blocked summary" {
+		t.Fatalf("answer after accepted blocked = %q", answer)
+	}
+	if agentCalls != 5 {
+		t.Errorf("expected 5 agent model calls, got %d", agentCalls)
+	}
+}
+
+func endTurn(text string) messageResponse {
+	return messageResponse{
+		ID: "msg_end", Content: []contentBlock{{Type: "text", Text: text}},
+		StopReason: "end_turn",
+	}
+}
+
+func blockedCall() messageResponse {
+	return messageResponse{
+		ID: "msg_blocked",
+		Content: []contentBlock{
+			{Type: "text", Text: "giving up"},
+			{Type: "tool_use", ID: "toolu_b", Name: "update_goal",
+				Input: json.RawMessage(`{"status":"blocked"}`)},
+		},
+		StopReason: "tool_use",
+	}
+}
+
+// TestGoalProgressResetsBlockedAudit verifies a successful tool run breaks
+// the impasse streak: blocked is rejected again after progress.
+func TestGoalProgressResetsBlockedAudit(t *testing.T) {
+	sender := &fakeSender{t: t}
+	agentCalls := 0
+	sender.script = func(call int, req messageRequest) messageResponse {
+		if len(req.Tools) == 0 {
+			return reviewVerdictResponse("APPROVE: harmless")
+		}
+		agentCalls++
+		switch agentCalls {
+		case 1: // impasse turn 1
+			return endTurn("stuck")
+		case 2: // premature blocked — rejected
+			return blockedCall()
+		case 3: // progress: a tool actually runs, streak resets to 0
+			return messageResponse{
+				ID: "msg_3",
+				Content: []contentBlock{
+					{Type: "tool_use", ID: "toolu_p", Name: "bash",
+						Input: json.RawMessage(`{"command":"echo found a path"}`)},
+				},
+				StopReason: "tool_use",
+			}
+		case 4: // impasse turn 1 again
+			return endTurn("stuck again")
+		case 5: // rejected — the streak restarted (1 < 3)
+			return blockedCall()
+		case 6: // impasse turn 2
+			return endTurn("same blocker returns")
+		case 7: // 3 >= 3: accepted
+			return messageResponse{
+				ID: "msg_7",
+				Content: []contentBlock{
+					{Type: "text", Text: "truly at an impasse"},
+					{Type: "tool_use", ID: "toolu_2", Name: "update_goal",
+						Input: json.RawMessage(`{"status":"blocked"}`)},
+				},
+				StopReason: "tool_use",
+			}
+		default:
+			return endTurn("gave up after the full audit")
+		}
+	}
+	cfg := config{model: "test-model", goal: "hard goal"}
+	answer, _, err := runPrompt(context.Background(), sender, cfg, nil, "go", func(string, ...any) {})
+	if err != nil {
+		t.Fatalf("runPrompt: %v", err)
+	}
+	if answer != "gave up after the full audit" {
+		t.Fatalf("answer after post-reset blocked = %q", answer)
+	}
+	if agentCalls != 8 {
+		t.Errorf("expected 8 agent model calls, got %d", agentCalls)
+	}
+}
+
+func TestNoGoalNoUpdateGoalTool(t *testing.T) {
+	sender := &fakeSender{t: t}
+	turns := 0
+	sender.script = func(call int, req messageRequest) messageResponse {
+		if len(req.Tools) == 0 {
+			return reviewVerdictResponse("APPROVE: harmless")
+		}
+		turns++
+		if strings.Contains(advertisedTools(req), "update_goal") {
+			t.Errorf("update_goal must not be advertised without a goal")
+		}
+		if strings.Contains(requestJSON(t, req), "Continue working toward the active session goal") {
+			t.Errorf("continuation steering must not appear without a goal")
+		}
+		return messageResponse{
+			ID: fmt.Sprintf("msg_%d", call), Content: []contentBlock{{Type: "text", Text: "done"}},
+			StopReason: "end_turn",
+		}
+	}
+	cfg := config{model: "test-model"}
+	answer, _, err := runPrompt(context.Background(), sender, cfg, nil, "hi", func(string, ...any) {})
+	if err != nil {
+		t.Fatalf("runPrompt: %v", err)
+	}
+	if answer != "done" || turns != 1 {
+		t.Fatalf("plain turn changed: %q after %d model calls", answer, turns)
 	}
 }

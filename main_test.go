@@ -478,3 +478,66 @@ func TestProviderSwitchRetiresInflightFetch(t *testing.T) {
 		t.Errorf("a fetch from the previous provider must not land: %v", ids)
 	}
 }
+
+func TestSlashGoal(t *testing.T) {
+	sess := newSlashSession(t)
+	report, got := slashReporter()
+
+	// Showing before anything is set.
+	if handled, _ := handleSlash(sess, "/goal", report); !handled {
+		t.Fatal("/goal not handled")
+	}
+	if !strings.Contains(lastReport(t, got), "no goal set") {
+		t.Errorf("empty /goal should show the unset state: %q", lastReport(t, got))
+	}
+
+	// Setting pins it for the reviewer.
+	if handled, _ := handleSlash(sess, "/goal fix the login bug", report); !handled {
+		t.Fatal("/goal not handled")
+	}
+	if sess.goal == nil || sess.goal.Objective != "fix the login bug" || sess.cfg.goal != "fix the login bug" {
+		t.Fatalf("goal not set: %+v cfg %+v", sess.goal, sess.cfg.goal)
+	}
+
+	// Changing it appends the supersede notice so the model pivots too.
+	sess.history = []message{textMessage("user", "start on the login bug")}
+	if handled, _ := handleSlash(sess, "/goal also update the docs", report); !handled {
+		t.Fatal("/goal not handled")
+	}
+	if sess.goal.Objective != "also update the docs" || sess.cfg.goal != "also update the docs" {
+		t.Fatalf("goal not updated: %+v", sess.goal)
+	}
+	last := sess.history[len(sess.history)-1]
+	var text string
+	if err := json.Unmarshal(last.Content, &text); err != nil {
+		t.Fatalf("supersede notice is not plain text: %v", err)
+	}
+	for _, want := range []string{"supersedes", "also update the docs", "previous goal"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("supersede notice missing %q:\n%s", want, text)
+		}
+	}
+
+	// Same objective is a no-op.
+	before := len(sess.history)
+	handleSlash(sess, "/goal also update the docs", report)
+	if len(sess.history) != before {
+		t.Error("setting the same goal must not append another notice")
+	}
+
+	// Clear drops it; /reset also clears.
+	if handled, _ := handleSlash(sess, "/goal clear", report); !handled {
+		t.Fatal("/goal not handled")
+	}
+	if sess.goal != nil || sess.cfg.goal != "" {
+		t.Fatalf("goal not cleared: %+v", sess.goal)
+	}
+	handleSlash(sess, "/goal again", report)
+	handleSlash(sess, "/reset", report)
+	if sess.goal != nil || sess.cfg.goal != "" {
+		t.Fatalf("/reset must clear the goal: %+v", sess.goal)
+	}
+	if len(sess.history) != 0 {
+		t.Fatal("/reset must clear history")
+	}
+}

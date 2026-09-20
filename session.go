@@ -16,12 +16,13 @@ import (
 // results — which is exactly what the next turn needs to continue the task
 // instead of restarting it.
 type sessionState struct {
-	Version  int       `json:"version"`
-	Provider string    `json:"provider"`
-	Model    string    `json:"model,omitempty"`
-	Effort   string    `json:"effort,omitempty"`
-	Title    string    `json:"title,omitempty"`
-	History  []message `json:"history"`
+	Version  int         `json:"version"`
+	Provider string      `json:"provider"`
+	Model    string      `json:"model,omitempty"`
+	Effort   string      `json:"effort,omitempty"`
+	Title    string      `json:"title,omitempty"`
+	Goal     *threadGoal `json:"goal,omitempty"`
+	History  []message   `json:"history"`
 }
 
 // sessionStateVersion bumps when the history shape changes in a way old
@@ -78,6 +79,7 @@ func saveSession(sess *session) error {
 		Model:    sess.cfg.model,
 		Effort:   sess.cfg.effort,
 		Title:    sess.title,
+		Goal:     sess.goal,
 		History:  sess.history,
 	}
 	if err := os.MkdirAll(filepath.Dir(sess.savePath), 0o755); err != nil {
@@ -358,6 +360,13 @@ func applySessionState(sess *session, st sessionState, path string) {
 	}
 	if validEffort(st.Effort) {
 		sess.cfg.effort = st.Effort
+	}
+	if st.Goal != nil && st.Goal.Objective != "" {
+		sess.goal = st.Goal
+		sess.cfg.goal = st.Goal.Objective
+	} else {
+		sess.goal = nil
+		sess.cfg.goal = ""
 	}
 	sess.history = st.History
 	sess.saved = true

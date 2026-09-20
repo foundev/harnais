@@ -257,6 +257,9 @@ type session struct {
 	provider string
 	cfg      config
 	history  []message
+	// goal is the session's explicit objective (/goal), persisted with
+	// the session and pinned as the reviewer's task (see goal.go).
+	goal *threadGoal
 	// savePath is where the session is written for -resume; "" disables
 	// saving. saved records whether the first successful save was
 	// reported, so the path is announced once, not after every turn.
@@ -341,7 +344,12 @@ func handleSlash(sess *session, line string, report progressFunc) (handled, exit
 	case "/reset":
 		sess.history = nil
 		sess.title = ""
+		sess.goal = nil
+		sess.cfg.goal = ""
+		goalBlockedTurns = 0
 		report("conversation reset")
+	case "/goal":
+		setSessionGoal(sess, strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "/goal")), report)
 	case "/new":
 		// Start a fresh conversation in this REPL, keeping the current
 		// provider, model, and effort. The conversation so far is saved
@@ -353,6 +361,9 @@ func handleSlash(sess *session, line string, report progressFunc) (handled, exit
 			}
 		}
 		sess.history = nil
+		sess.goal = nil
+		sess.cfg.goal = ""
+		goalBlockedTurns = 0
 		sess.title = ""
 		sess.savePath = ""
 		sess.saved = false
@@ -391,6 +402,7 @@ func handleSlash(sess *session, line string, report progressFunc) (handled, exit
   /model [id]        show or set the model id (saved as default)
   /effort [level]    show or set reasoning effort: low, medium, high, default (saved as default; sent to all backends)
   /reset             clear conversation history
+  /goal [objective]  show, set, or (with "clear") drop the session goal — while a goal is active, turns continue automatically until the model calls update_goal (complete or blocked), and the reviewer judges every mutating tool call against the goal
   /new               start a fresh session (the current one is saved and stays resumable)
   /resume [words]    continue a saved session, replaying its transcript: bare /resume lists them to pick from, or type words to match a session's title
   /exit              leave
@@ -565,7 +577,7 @@ func listModels(ctx context.Context, sender messageSender, provider string) ([]s
 
 // slashCommands, providerNames, and effortLevels feed live completion.
 var (
-	slashCommands = []string{"/effort", "/exit", "/help", "/model", "/new", "/provider", "/quit", "/reset", "/resume"}
+	slashCommands = []string{"/effort", "/exit", "/goal", "/help", "/model", "/new", "/provider", "/quit", "/reset", "/resume"}
 	providerNames = []string{"anthropic", "codex", "deepseek", "inceptron", "openai", "openrouter"}
 	effortLevels  = []string{"default", "high", "low", "medium"}
 )

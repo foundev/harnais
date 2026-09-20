@@ -100,6 +100,9 @@ Session commands:
 anthropic> /provider openrouter   # switch backend, saved as default (model resets, history kept)
 anthropic> /model my-model        # use a different model id, saved as default
 anthropic> /effort high           # reasoning effort (low, medium, high, default), saved as default
+anthropic> /goal fix the login bug # set the session goal: turns continue until the model calls update_goal (complete/blocked)
+anthropic> /goal also the docs     # change it — the old goal is superseded in the conversation
+anthropic> /goal clear             # drop it — turns end normally again
 anthropic> /reset                 # clear history
 anthropic> /exit                  # leave
 ```
@@ -180,7 +183,7 @@ for `-provider=deepseek`, `gpt-5-mini` for `-provider=openai`,
 | `CODEX_BASE_URL`     | Codex backend root (default `https://chatgpt.com/backend-api/codex`) |
 | `HARNAIS_DEBUG`      | When set to a file path, appends Codex request/response bodies there (never tokens) |
 
-In a session, `/help` lists the slash commands (`/provider`, `/model`, `/effort`, `/reset`, `/exit`).
+In a session, `/help` lists the slash commands (`/provider`, `/model`, `/effort`, `/goal`, `/reset`, `/exit`).
 
 ## Review
 
@@ -188,8 +191,11 @@ There are no human confirmation prompts. Instead, every mutating tool call
 (`bash`, `edit`, `write`; `read` runs free) goes to a separate reviewer
 pass over the same backend before it runs — the same idea as [Codex
 auto-review](https://learn.chatgpt.com/docs/sandboxing/auto-review),
-without its policy config. The reviewer sees the session's original task
-plus a compact transcript and the exact proposed action, and answers
+without its policy config. The reviewer sees the session's task — an
+explicit `/goal` objective when one is set, otherwise every user prompt
+of the session retained in order (later ones supersede earlier ones, as
+in Codex's retained user instructions) — plus a compact transcript and
+the exact proposed action, and answers
 `APPROVE`/`DENY` with a rationale; a
 denial returns the rationale with instructions to find a materially safer
 path, and three denials in a row abort the turn. Each review costs extra
@@ -200,7 +206,14 @@ OS sandbox; anything else stays confined, and the agent itself can never
 request the escalation — only the reviewer pass grants it.
 
 Tool progress, including `review: approved/denied` lines, goes to stderr,
-so `harnais "prompt" > answer.txt` captures just the final answer.
+so `harnais "prompt" > answer.txt` captures just the final answer. When an
+`edit` or `write` lands, the change also appears on stderr as a colored
+unified diff — line-number gutters, `+`/`-` gutter signs, green additions,
+red deletions, dim context — after the style of codex's diff renderer. The
+model still receives the plain tool result, and the diff respects the same
+color kill switches (`NO_COLOR`, piped stderr).
+
+## Tools
 
 ## Tools
 

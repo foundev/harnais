@@ -21,8 +21,9 @@ func TestSessionRoundTrip(t *testing.T) {
 
 	sess := &session{
 		provider: "openrouter",
-		cfg:      config{model: "openai/gpt-5-mini", effort: "low"},
+		cfg:      config{model: "openai/gpt-5-mini", effort: "low", goal: "fix the failing test"},
 		savePath: path,
+		goal:     &threadGoal{Objective: "fix the failing test"},
 		history: []message{
 			textMessage("user", "fix the failing test"),
 			blocksMessage("assistant", []contentBlock{
@@ -49,6 +50,9 @@ func TestSessionRoundTrip(t *testing.T) {
 	applySessionState(loaded, st, gotPath)
 	if loaded.provider != "openrouter" || loaded.cfg.model != "openai/gpt-5-mini" || loaded.cfg.effort != "low" {
 		t.Errorf("backend not restored: %s %+v", loaded.provider, loaded.cfg)
+	}
+	if loaded.goal == nil || loaded.goal.Objective != "fix the failing test" || loaded.cfg.goal != "fix the failing test" {
+		t.Errorf("goal not restored: %+v cfg %+v", loaded.goal, loaded.cfg.goal)
 	}
 	if got, _ := json.Marshal(sess.history); string(got) == "null" {
 		t.Fatal("history must not be empty after save")

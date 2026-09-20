@@ -1,3 +1,5 @@
 .bifrost/cache/
 /harnais
 .brokk
+/dist/
+/dist-check/
