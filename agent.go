@@ -59,7 +59,9 @@ type progressFunc func(format string, args ...any)
 func runPrompt(ctx context.Context, sender messageSender, cfg config, history []message, prompt string, report progressFunc) (string, []message, error) {
 	history = append(history, textMessage("user", prompt))
 	consecutiveDenials := 0
-	for i := 0; i < cfg.maxIters; i++ {
+	// maxIters <= 0 means no cap: the loop ends when the model stops asking
+	// for tools, which is the only stop a real task should hit.
+	for i := 0; cfg.maxIters <= 0 || i < cfg.maxIters; i++ {
 		spin := startSpinner("thinking")
 		resp, err := sender.createMessage(ctx, messageRequest{
 			Model:     cfg.model,
@@ -76,6 +78,7 @@ func runPrompt(ctx context.Context, sender messageSender, cfg config, history []
 		history = append(history, blocksMessage("assistant", resp.Content))
 
 		if resp.StopReason != "tool_use" {
+			reportTruncation(resp.StopReason, cfg, report)
 			return responseText(resp), history, nil
 		}
 
@@ -144,7 +147,39 @@ func runPrompt(ctx context.Context, sender messageSender, cfg config, history []
 		}
 		history = append(history, blocksMessage("user", results))
 	}
-	return "", history, fmt.Errorf("reached iteration limit (%d) without a final answer", cfg.maxIters)
+	return "", history, iterationCapError{limit: cfg.maxIters}
+}
+
+// iterationCapError reports a turn that ran out of its per-prompt budget
+// with tool results still pending. It is a soft stop, not a failure: the
+// history comes back with the turn's work in it, so the next prompt picks
+// up where this one stopped instead of starting over.
+type iterationCapError struct {
+	limit int
+}
+
+func (e iterationCapError) Error() string {
+	return fmt.Sprintf("stopped at the iteration cap (%d) with work in progress — send another message and it will carry on from here (raise or drop the cap with -n)", e.limit)
+}
+
+// reportTruncation says so when a stop reason means the model was cut off
+// mid-answer rather than finishing. Nothing in harnais caps a reply by
+// default, so this fires only when -max-tokens is set or a model runs into
+// its own ceiling — either way the answer on screen is incomplete and the
+// user is the one who needs to know.
+func reportTruncation(stopReason string, cfg config, report progressFunc) {
+	switch stopReason {
+	case "max_tokens", "length": // Anthropic, then OpenAI-compatible backends
+	default:
+		return
+	}
+	if cfg.maxTokens > 0 {
+		report("%s", paint(ansiYellow, fmt.Sprintf(
+			"answer cut off at the -max-tokens cap (%d) — raise it, or drop -max-tokens to let the model finish", cfg.maxTokens)))
+		return
+	}
+	report("%s", paint(ansiYellow,
+		"answer cut off at the model's own output limit — ask for the rest, or have it write to a file in parts"))
 }
 
 func responseText(resp *messageResponse) string {

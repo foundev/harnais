@@ -36,6 +36,30 @@ func TestBuildAnthropicRequestEffort(t *testing.T) {
 	}
 }
 
+func TestAnthropicMaxTokensOnTheWire(t *testing.T) {
+	// The Messages API takes a max_tokens, so an uncapped request asks for
+	// the largest output current Claude models allow. -max-tokens overrides
+	// it, and nothing else inspects the value: it is the API's business.
+	for _, tc := range []struct {
+		name     string
+		request  int
+		wantSent int
+	}{
+		{"uncapped asks for the model's maximum", 0, anthropicMaxOutputTokens},
+		{"an explicit cap is sent as-is", 4096, 4096},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := buildAnthropicRequest(messageRequest{Model: "m", MaxTokens: tc.request})
+			if req.MaxTokens != tc.wantSent {
+				t.Errorf("max_tokens = %d, want %d", req.MaxTokens, tc.wantSent)
+			}
+			if tc.request == 0 && anthropicMaxOutputTokens != 128000 {
+				t.Errorf("uncapped anthropic requests must ask for 128K, got %d", anthropicMaxOutputTokens)
+			}
+		})
+	}
+}
+
 func TestDecodeAnthropicModelsPage(t *testing.T) {
 	ids, lastID, hasMore, err := decodeAnthropicModelsPage([]byte(`{"data":[{"type":"model","id":"claude-sonnet-4-20250514"},{"id":"claude-opus-4"}],"has_more":true,"last_id":"claude-opus-4"}`))
 	if err != nil {

@@ -426,3 +426,27 @@ func TestDecodeModelsList(t *testing.T) {
 		t.Error("expected decode error for broken JSON")
 	}
 }
+
+func TestChatRequestOmitsMaxTokensWhenUncapped(t *testing.T) {
+	// OpenAI-compatible backends get no output cap from harnais: the field
+	// is dropped when nothing was asked for, so the backend decides — the
+	// same thing Codex does, whose sampling request carries no output-token
+	// field at all.
+	wire := func(maxTokens int) string {
+		raw, err := json.Marshal(toChatRequest(messageRequest{
+			Model:     "m",
+			MaxTokens: maxTokens,
+			Messages:  []message{textMessage("user", "hi")},
+		}, false))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(raw)
+	}
+	if blob := wire(0); strings.Contains(blob, "max_tokens") {
+		t.Errorf("an uncapped request must not carry max_tokens: %s", blob)
+	}
+	if blob := wire(4096); !strings.Contains(blob, `"max_tokens":4096`) {
+		t.Errorf("an explicit cap must reach the wire: %s", blob)
+	}
+}

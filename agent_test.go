@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -288,6 +289,151 @@ func TestReviewerUnavailableAbortsTurn(t *testing.T) {
 		func(format string, args ...any) {})
 	if err == nil || !strings.Contains(err.Error(), "reviewer unavailable") {
 		t.Fatalf("expected reviewer outage error, got %v", err)
+	}
+}
+
+// TestIterationCapIsASoftStop pins the contract that matters for long
+// tasks: running out of budget hands the turn's work back instead of
+// throwing it away, and a follow-up prompt resumes from it.
+func TestIterationCapIsASoftStop(t *testing.T) {
+	readPath := filepath.Join(t.TempDir(), "notes.txt")
+	if err := os.WriteFile(readPath, []byte("the answers are here\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sender := &fakeSender{t: t}
+	sender.script = func(call int, req messageRequest) messageResponse {
+		if len(req.Tools) == 0 {
+			return reviewVerdictResponse("APPROVE")
+		}
+		// Keep asking for a tool the reviewer never has to approve.
+		return messageResponse{
+			ID: fmt.Sprintf("msg_%d", call),
+			Content: []contentBlock{
+				{Type: "tool_use", ID: fmt.Sprintf("toolu_%d", call), Name: "read",
+					Input: json.RawMessage(`{"path":` + strconv.Quote(readPath) + `}`)},
+			},
+			StopReason: "tool_use",
+		}
+	}
+
+	cfg := config{model: "test-model", maxTokens: 128, maxIters: 3}
+	answer, history, err := runPrompt(context.Background(), sender, cfg, nil, "keep reading",
+		func(format string, args ...any) {})
+	var capErr iterationCapError
+	if !errors.As(err, &capErr) {
+		t.Fatalf("expected the iteration cap, got %v", err)
+	}
+	if answer != "" {
+		t.Errorf("a capped turn has no answer, got %q", answer)
+	}
+	if !strings.Contains(capErr.Error(), "carry on") || !strings.Contains(capErr.Error(), "-n") {
+		t.Errorf("the cap must tell the user how to continue: %q", capErr.Error())
+	}
+	// The three tool results are in the history, so nothing was thrown away.
+	if got := strings.Count(requestJSON(t, messageRequest{Messages: history}), "the answers are here"); got != 3 {
+		t.Fatalf("capped turn must keep its tool results, found %d in history", got)
+	}
+
+	// The next prompt resumes: the model sees the earlier reads.
+	sender.script = func(call int, req messageRequest) messageResponse {
+		if len(req.Tools) == 0 {
+			return reviewVerdictResponse("APPROVE")
+		}
+		if blob := requestJSON(t, req); !strings.Contains(blob, "the answers are here") {
+			t.Errorf("resumed turn must carry the earlier tool results: %s", blob)
+		}
+		return messageResponse{
+			ID:         "msg_done",
+			Content:    []contentBlock{{Type: "text", Text: "picked up where we left off"}},
+			StopReason: "end_turn",
+		}
+	}
+	answer, _, err = runPrompt(context.Background(), sender, cfg, history, "carry on",
+		func(format string, args ...any) {})
+	if err != nil || answer != "picked up where we left off" {
+		t.Fatalf("resumed turn failed: answer=%q err=%v", answer, err)
+	}
+}
+
+func TestTruncatedAnswerIsReported(t *testing.T) {
+	// Anthropic says stop_reason "max_tokens" and OpenAI-compatible backends
+	// say finish_reason "length" when the model was cut off mid-answer. The
+	// docs put it plainly for thinking models: "a long thinking pass can
+	// consume the budget before the text response completes". The answer
+	// still comes back, but it must never come back silently short.
+	for _, tc := range []struct {
+		name    string
+		reason  string
+		cap     int
+		wantSub string
+	}{
+		{"anthropic at the user's cap", "max_tokens", 4096, "-max-tokens cap (4096)"},
+		{"openai-style at the model's limit", "length", 0, "model's own output limit"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sender := &fakeSender{t: t}
+			sender.script = func(int, messageRequest) messageResponse {
+				return messageResponse{
+					ID:         "msg_trunc",
+					Content:    []contentBlock{{Type: "text", Text: "the answer so far"}},
+					StopReason: tc.reason,
+				}
+			}
+			var lines []string
+			answer, _, err := runPrompt(context.Background(), sender,
+				config{model: "m", maxTokens: tc.cap}, nil, "write something long",
+				func(format string, args ...any) { lines = append(lines, fmt.Sprintf(format, args...)) })
+			if err != nil {
+				t.Fatalf("a truncated answer is not a failure: %v", err)
+			}
+			if answer != "the answer so far" {
+				t.Errorf("partial answer must survive, got %q", answer)
+			}
+			if joined := strings.Join(lines, "\n"); !strings.Contains(joined, tc.wantSub) {
+				t.Errorf("truncation must be reported (%q missing):\n%s", tc.wantSub, joined)
+			}
+		})
+	}
+}
+
+// TestZeroMaxItersMeansNoCap: the loop's only stop with -n 0 is the model
+// deciding it is done.
+func TestZeroMaxItersMeansNoCap(t *testing.T) {
+	readPath := filepath.Join(t.TempDir(), "notes.txt")
+	if err := os.WriteFile(readPath, []byte("still going\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	const rounds = 40
+	sender := &fakeSender{t: t}
+	sender.script = func(call int, req messageRequest) messageResponse {
+		if len(req.Tools) == 0 {
+			return reviewVerdictResponse("APPROVE")
+		}
+		if call <= rounds {
+			return messageResponse{
+				ID: fmt.Sprintf("msg_%d", call),
+				Content: []contentBlock{
+					{Type: "tool_use", ID: fmt.Sprintf("toolu_%d", call), Name: "read",
+						Input: json.RawMessage(`{"path":` + strconv.Quote(readPath) + `}`)},
+				},
+				StopReason: "tool_use",
+			}
+		}
+		return messageResponse{
+			ID:         "msg_done",
+			Content:    []contentBlock{{Type: "text", Text: "finally done"}},
+			StopReason: "end_turn",
+		}
+	}
+
+	cfg := config{model: "test-model", maxTokens: 128} // maxIters 0 = no cap
+	answer, _, err := runPrompt(context.Background(), sender, cfg, nil, "go",
+		func(format string, args ...any) {})
+	if err != nil || answer != "finally done" {
+		t.Fatalf("an uncapped loop must run to the model's own stop: answer=%q err=%v", answer, err)
+	}
+	if len(sender.requests) != rounds+1 {
+		t.Errorf("expected %d model calls, got %d", rounds+1, len(sender.requests))
 	}
 }
 

@@ -95,11 +95,20 @@ func newAnthropicClient(apiKey, baseURL string) *anthropicClient {
 	}
 }
 
+// anthropicMaxOutputTokens is the max_tokens harnais asks for when no
+// -max-tokens is set: the Messages API takes a number, so "uncapped" is
+// expressed as the largest output current Claude models allow (128K).
+const anthropicMaxOutputTokens = 128000
+
 // buildAnthropicRequest projects harness-internal effort onto the wire
-// shape. Pure so the mapping stays testable without network.
+// shape, and fills in the one field Anthropic wants a number for. Pure so
+// the mapping stays testable without network.
 func buildAnthropicRequest(req messageRequest) messageRequest {
 	if req.Effort != "" {
 		req.OutputConfig = &outputConfig{Effort: req.Effort}
+	}
+	if req.MaxTokens <= 0 {
+		req.MaxTokens = anthropicMaxOutputTokens
 	}
 	return req
 }
@@ -186,9 +195,9 @@ func decodeAnthropicModelsPage(raw []byte) (ids []string, lastID string, hasMore
 	return ids, page.LastID, page.HasMore, nil
 }
 
-// listModels fetches the backend's model IDs for /models and TAB
-// completion (see main.go), following the cursor until the pages run out
-// (bounded: a broken has_more loop must not spin forever).
+// listModels fetches the backend's model IDs for live completion (see
+// main.go), following the cursor until the pages run out (bounded: a broken
+// has_more loop must not spin forever).
 func (c *anthropicClient) listModels(ctx context.Context) ([]string, error) {
 	var ids []string
 	afterID := ""

@@ -3,9 +3,11 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -166,6 +168,54 @@ func TestReplPromptWithoutCredential(t *testing.T) {
 	}
 }
 
+func TestIterationCapIsOffByDefault(t *testing.T) {
+	// Turns end when the model stops asking for tools, not when a counter
+	// runs out: the budget is opt-in via -n N.
+	if defaultMaxIters != 0 {
+		t.Fatalf("the agent loop must ship uncapped, got default -n %d", defaultMaxIters)
+	}
+}
+
+func TestReplKeepsTheTurnWhenItStops(t *testing.T) {
+	// A turn that runs into the iteration cap must leave its work in the
+	// session: the user's next message resumes the task instead of
+	// restarting it from nothing.
+	readPath := filepath.Join(t.TempDir(), "notes.txt")
+	if err := os.WriteFile(readPath, []byte("halfway\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sender := &fakeSender{t: t}
+	sender.script = func(call int, req messageRequest) messageResponse {
+		return messageResponse{
+			ID: fmt.Sprintf("msg_%d", call),
+			Content: []contentBlock{
+				{Type: "tool_use", ID: fmt.Sprintf("toolu_%d", call), Name: "read",
+					Input: json.RawMessage(`{"path":` + strconv.Quote(readPath) + `}`)},
+			},
+			StopReason: "tool_use",
+		}
+	}
+	sess := &session{
+		sender:   sender,
+		provider: "anthropic",
+		cfg:      config{model: "m", maxIters: 2},
+	}
+	report, got := slashReporter()
+	in := bufio.NewReader(strings.NewReader("read the notes\n/exit\n"))
+	if code := repl(context.Background(), sess, in, report); code != 0 {
+		t.Fatalf("repl should survive the cap, got exit %d", code)
+	}
+	if !strings.Contains(strings.Join(*got, "\n"), "iteration cap") {
+		t.Errorf("the cap must be reported: %v", *got)
+	}
+	if len(sess.history) == 0 {
+		t.Fatal("a stopped turn must keep its history")
+	}
+	if blob := requestJSON(t, messageRequest{Messages: sess.history}); !strings.Contains(blob, "halfway") {
+		t.Errorf("the stopped turn must keep its tool results: %s", blob)
+	}
+}
+
 func TestLoadStoredConfig(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.json")
@@ -294,11 +344,11 @@ func TestProviderSwitchInvalidatesModelCache(t *testing.T) {
 	sess.maxTokensFlag = 0
 	handleSlash(sess, "/provider inceptron", report)
 	if sess.cfg.maxTokens != 0 {
-		t.Errorf("inceptron must default to an uncapped budget, got %d", sess.cfg.maxTokens)
+		t.Errorf("switching providers must keep the uncapped default, got %d", sess.cfg.maxTokens)
 	}
 	handleSlash(sess, "/provider anthropic", report)
-	if sess.cfg.maxTokens != 8192 {
-		t.Errorf("anthropic must default to 8192, got %d", sess.cfg.maxTokens)
+	if sess.cfg.maxTokens != 0 {
+		t.Errorf("anthropic must default to no cap, got %d", sess.cfg.maxTokens)
 	}
 	// An explicit flag rides along across switches.
 	sess.maxTokensFlag = 4096
@@ -308,14 +358,12 @@ func TestProviderSwitchInvalidatesModelCache(t *testing.T) {
 	}
 }
 
-func TestDefaultMaxTokens(t *testing.T) {
-	if got := defaultMaxTokens("inceptron"); got != 0 {
-		t.Errorf("inceptron must be uncapped, got %d", got)
-	}
-	for _, p := range []string{"anthropic", "openrouter", "deepseek", "openai", "codex", "unknown"} {
-		if got := defaultMaxTokens(p); got != 8192 {
-			t.Errorf("%s must keep 8192, got %d", p, got)
-		}
+func TestResponsesAreUncappedByDefault(t *testing.T) {
+	// No arbitrary output cap anywhere: an 8k ceiling truncates exactly the
+	// long answers people ask for, after paying for the work that produced
+	// them. -max-tokens N is the opt-in cap.
+	if defaultMaxTokens != 0 {
+		t.Fatalf("harnais must ship with no output cap, got %d", defaultMaxTokens)
 	}
 }
 
