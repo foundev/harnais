@@ -244,9 +244,12 @@ Resuming restores the history and backend, replays the conversation as a
 compact transcript (full text, tool calls and results one line each), and
 the conversation continues in the same REPL. Inside a session, `/resume`
 does the same: it saves the
-current conversation, then loads the most recent *other* session into the
-live REPL (so it never just reloads itself). Sessions that never sent a
-prompt are never written, and both paths skip empty or unreadable files.
+current conversation, then lists the saved sessions (excluding this one,
+so it never just reloads itself) to pick from — with live completion by
+session title. Or skip the list with `/resume <words>`, which loads the
+session whose title matches. Sessions are titled after their first
+prompt. Sessions that never sent a prompt are never written, and both
+paths skip empty or unreadable files.
 
 ## Layout
 
@@ -269,7 +272,6 @@ prompt are never written, and both paths skip empty or unreadable files.
 - Integrated web search tooling
 - Image support
 - @ files to add them to the context
-- Session pickers for -resume (list, named sessions)
 - Z.ai subscription support
 
 ## License

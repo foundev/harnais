@@ -4,11 +4,13 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -255,6 +257,13 @@ type session struct {
 	// reported, so the path is announced once, not after every turn.
 	savePath string
 	saved    bool
+	// title names the session for /resume (first prompt, fixed at first
+	// save). Empty until then.
+	title string
+	// pickResume, when set (interactive REPLs only), lets /resume present
+	// the saved sessions as a selectable list instead of always taking
+	// the most recent one. Tests inject fakes to stay off the terminal.
+	pickResume func(choices []resumeChoice, report progressFunc) (resumeChoice, bool)
 	// keyFlag is the startup -key, used for the initial backend only;
 	// switching providers falls back to environment credentials.
 	keyFlag string
@@ -326,6 +335,7 @@ func handleSlash(sess *session, line string, report progressFunc) (handled, exit
 		return true, true
 	case "/reset":
 		sess.history = nil
+		sess.title = ""
 		report("conversation reset")
 	case "/new":
 		// Start a fresh conversation in this REPL, keeping the current
@@ -338,26 +348,37 @@ func handleSlash(sess *session, line string, report progressFunc) (handled, exit
 			}
 		}
 		sess.history = nil
+		sess.title = ""
 		sess.savePath = ""
 		sess.saved = false
 		report("%s", paint(ansiGreen, "new session — the previous one stays resumable with /resume or -resume"))
 	case "/resume":
-		// Load the most recent other session into this one. The live
-		// session is excluded so /resume never just reloads itself, and
-		// the current conversation is saved first so it stays resumable
-		// after you switch away.
+		// Load another session into this one. The live session is
+		// excluded so /resume never just reloads itself, and the current
+		// conversation is saved first so it stays resumable after you
+		// switch away.
 		if sess.history != nil && sess.savePath != "" {
 			if err := saveSession(sess); err != nil {
 				report("%s", paint(ansiYellow, fmt.Sprintf("could not save the current session before switching: %v", err)))
 			}
 		}
-		st, path, err := latestSession(sess.savePath)
-		if err != nil {
+		arg := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "/resume"))
+		st, path, err := chooseResumeTarget(sess, arg, report)
+		switch {
+		case errors.Is(err, errResumeCancelled):
+			report("%s", paint(ansiDim, "resume cancelled"))
+		case err != nil:
 			report("%s", paint(ansiYellow, fmt.Sprintf("cannot resume: %v", err)))
+		}
+		if err != nil {
 			break
 		}
 		applySessionState(sess, st, path)
-		report("%s", paint(ansiGreen, fmt.Sprintf("resumed %s — %s (%d messages)", filepath.Base(path), sess.provider+"/"+sess.cfg.model, len(sess.history))))
+		name := sess.title
+		if name == "" {
+			name = filepath.Base(path)
+		}
+		report("%s", paint(ansiGreen, fmt.Sprintf("resumed %s — %s (%d messages)", name, sess.provider+"/"+sess.cfg.model, len(sess.history))))
 		replayTranscript(sess.history, report)
 	case "/help":
 		report(`Prompts go straight to the model. Commands:
@@ -366,10 +387,10 @@ func handleSlash(sess *session, line string, report progressFunc) (handled, exit
   /effort [level]    show or set reasoning effort: low, medium, high, default (saved as default; sent to all backends)
   /reset             clear conversation history
   /new               start a fresh session (the current one is saved and stays resumable)
-  /resume            load the most recent saved session (excluding this one) and replay its transcript
+  /resume [words]    continue a saved session, replaying its transcript: bare /resume lists them to pick from, or type words to match a session's title
   /exit              leave
 
-Sessions auto-save as they run; restart the latest with: harnais -resume`)
+Sessions auto-save as they run, titled after their first prompt; restart the latest with: harnais -resume`)
 	case "/provider":
 		if len(fields) < 2 {
 			report("provider: %s (model %s, effort %s)", sess.provider, sess.cfg.model, describeEffort(sess))
@@ -567,9 +588,124 @@ func replCompleter(ctx context.Context, sess *session) completer {
 			return modelCompletions(modelSnapshot(sess), word, sess.provider)
 		case "/effort":
 			return prefixCompletions(effortLevels, word)
+		case "/resume":
+			// Sessions by title — the same matching chooseResumeTarget
+			// applies to the argument.
+			return sessionCompletions(listSessions(sess.savePath), line)
 		}
 		return nil
 	}
+}
+
+// errResumeCancelled marks a /resume the user backed out of — not a
+// failure, so it reports differently from a real problem.
+var errResumeCancelled = errors.New("resume cancelled")
+
+// chooseResumeTarget resolves /resume's argument to a session to load.
+// No argument: the picker when one is available (interactive REPLs),
+// otherwise the most recent session. With words: the session whose
+// title, file name, or number matches — one match loads directly, several
+// go through the picker (or read as ambiguous when there is no picker).
+func chooseResumeTarget(sess *session, words string, report progressFunc) (sessionState, string, error) {
+	choices := listSessions(sess.savePath)
+	if words != "" {
+		choices = filterSessions(choices, words)
+		if len(choices) == 0 {
+			return sessionState{}, "", fmt.Errorf("no saved session matches %q", words)
+		}
+	}
+	if len(choices) == 0 {
+		return sessionState{}, "", fmt.Errorf("no saved session with a conversation — pass -resume after a first session exists")
+	}
+	if sess.pickResume != nil {
+		// Interactive: even one match goes through the picker, so the
+		// list is visible and backing out is possible.
+		pick, ok := sess.pickResume(choices, report)
+		if !ok {
+			return sessionState{}, "", errResumeCancelled
+		}
+		choices = []resumeChoice{pick}
+	} else if len(choices) > 1 {
+		if words != "" {
+			// Several matches with no picker (piped input, tests) read
+			// as ambiguous rather than silently taking the newest.
+			return sessionState{}, "", fmt.Errorf("%q matches %d sessions — be more specific: %s", words, len(choices), choiceTitles(choices))
+		}
+		// No picker and no argument: bare /resume keeps its original
+		// meaning — the most recent session.
+		choices = choices[:1]
+	}
+	st, err := loadSessionState(choices[0].Path)
+	if err != nil {
+		return sessionState{}, "", err
+	}
+	return st, choices[0].Path, nil
+}
+
+// choiceTitles renders a match list for the ambiguous-match report.
+func choiceTitles(choices []resumeChoice) string {
+	parts := make([]string, 0, len(choices))
+	for _, c := range choices {
+		parts = append(parts, c.Title)
+	}
+	return strings.Join(parts, ", ")
+}
+
+// chooseSession is the interactive /resume picker: it prints the saved
+// sessions and reads a selection with the same live completion as the
+// prompt — arrows move through the rows, Enter takes one, and typing
+// narrows by title, file name, or list number. An empty line or ^C/^D
+// cancels; anything unmatched asks again.
+func chooseSession(choices []resumeChoice, report progressFunc) (resumeChoice, bool) {
+	report("saved sessions (newest first):")
+	for i, c := range choices {
+		report("  %s", fmt.Sprintf("%d. %s", i+1, c.label()))
+	}
+	for {
+		line, exit := readLineEdited(paint(ansiBoldCyan, "resume which? (Enter to cancel) > "), func(l string) []completion {
+			return sessionCompletions(choices, l)
+		})
+		if exit {
+			return resumeChoice{}, false
+		}
+		answer := strings.TrimSpace(line)
+		if answer == "" {
+			return resumeChoice{}, false
+		}
+		matches := filterSessions(choices, answer)
+		if n, err := strconv.Atoi(answer); err == nil && n >= 1 && n <= len(choices) {
+			return choices[n-1], true
+		}
+		if len(matches) == 1 {
+			return matches[0], true
+		}
+		if len(matches) > 1 {
+			report("%s", paint(ansiYellow, fmt.Sprintf("%q matches %d sessions — be more specific", answer, len(matches))))
+			continue
+		}
+		report("%s", paint(ansiYellow, fmt.Sprintf("no session matching %q — Enter alone cancels", answer)))
+	}
+}
+
+// sessionCompletions feeds the picker's live list: every session the
+// typed word matches by title, file name, or list number, offered as its
+// number (what Enter inserts) with a label showing the full choice.
+func sessionCompletions(choices []resumeChoice, line string) []completion {
+	// Filter the whole list so the numbers in the labels stay the ones
+	// the picker (and /resume <number>) understands.
+	matches := choices
+	if word := strings.ToLower(strings.TrimSpace(lastWord(line))); word != "" {
+		matches = filterSessions(choices, word)
+	}
+	var out []completion
+	for _, c := range matches {
+		i := 0
+		for choices[i].Path != c.Path {
+			i++
+		}
+		out = append(out, completion{Value: strconv.Itoa(i + 1), Label: fmt.Sprintf("%d. %s", i+1, c.label())})
+	}
+	return out
 }
 
 // prefixCompletions offers the candidates the typed word starts.
@@ -695,6 +831,7 @@ func repl(ctx context.Context, sess *session, in *bufio.Reader, report progressF
 	var completeFn completer
 	if interactive {
 		completeFn = replCompleter(ctx, sess)
+		sess.pickResume = chooseSession
 		// Warm the model list now so the first /model keystroke already
 		// has something to suggest.
 		startModelFetch(ctx, sess)
