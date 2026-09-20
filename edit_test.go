@@ -242,19 +242,29 @@ func TestSuggestionRowsCapLongLists(t *testing.T) {
 	for i := 1; i <= 12; i++ {
 		all = append(all, completion{Value: fmt.Sprintf("model-%02d", i), Label: fmt.Sprintf("model-%02d", i)})
 	}
-	e := &lineEditor{prompt: "> ", complete: func(string) []completion { return all }}
-	rows := suggestionRows(e.candidates())
-	if len(rows) != maxSuggestions+2 {
-		t.Fatalf("a long list must be capped, got %d rows", len(rows))
-	}
-	if !strings.Contains(rows[maxSuggestions], "4 more") {
-		t.Errorf("the cap must say how many are hidden: %q", rows[maxSuggestions])
+	var out bytes.Buffer
+	e := &lineEditor{out: &out, prompt: "> ", complete: func(string) []completion { return all }}
+	rows := suggestionRows(all, 0)
+	if len(rows) != maxSuggestions+1 {
+		t.Fatalf("a long list must be windowed, got %d rows", len(rows))
 	}
 	if !strings.Contains(rows[len(rows)-1], completionHint) {
 		t.Errorf("the hint must sit under the matches: %q", rows[len(rows)-1])
 	}
 	if strings.Contains(strings.Join(rows, "\n"), "model-12") {
-		t.Error("rows past the cap must not be drawn")
+		t.Error("the window must not show rows past its top+maxSuggestions")
+	}
+	// The window scrolls with the selection, so a long list stays fully
+	// reachable with the arrows.
+	e.sel = 11
+	e.scrollIntoView()
+	out.Reset()
+	e.draw()
+	if !strings.Contains(out.String(), "model-12") {
+		t.Errorf("the last candidate must be drawable by scrolling: %q", out.String())
+	}
+	if !strings.Contains(out.String(), "model-09") {
+		t.Errorf("scrolling must slide the window down, not jump to the end: %q", out.String())
 	}
 }
 

@@ -100,6 +100,7 @@ type lineEditor struct {
 	complete completer
 	line     []byte
 	sel      int // highlighted candidate; -1 means none
+	top      int // first candidate shown when the list exceeds maxSuggestions
 }
 
 // readLineRaw is the editor core: it echoes to out, edits the line on
@@ -207,8 +208,10 @@ func readLineRaw(in io.Reader, out io.Writer, prompt string, complete completer)
 // cursor up: the transcript above the prompt is the user's, and a cursor
 // that walks over it takes the history with it.
 func (e *lineEditor) draw() {
-	rows := suggestionRows(e.candidates())
-	if e.sel >= len(rows) {
+	cands := e.candidates()
+	e.clampTop(cands)
+	rows := suggestionRows(cands, e.top)
+	if e.sel >= len(cands) {
 		e.sel = -1
 	}
 	// Home + erase-down drops the prompt line's old text and the block
@@ -216,7 +219,7 @@ func (e *lineEditor) draw() {
 	fmt.Fprint(e.out, "\r\033[J")
 	fmt.Fprint(e.out, e.prompt, string(e.line))
 	for i, row := range rows {
-		if i == e.sel {
+		if i == e.sel-e.top {
 			row = colorize(ansiReverse, row)
 		}
 		fmt.Fprintf(e.out, "\r\n\033[K%s", row)
@@ -249,63 +252,78 @@ func (e *lineEditor) candidates() []completion {
 	return e.complete(string(e.line))
 }
 
-// suggestionRows renders the matches, a count of the ones that did not fit,
-// and the hint line. Only the matches are selectable.
-func suggestionRows(cands []completion) []string {
+// suggestionRows renders the visible window of matches — a scrolling
+// slice of the full list when it exceeds maxSuggestions, so the arrows
+// reach every row — plus the hint line.
+func suggestionRows(cands []completion, top int) []string {
 	if len(cands) == 0 {
 		return nil
 	}
 	rows := make([]string, 0, maxSuggestions+2)
-	for i, c := range cands {
-		if i == maxSuggestions {
-			rows = append(rows, paint(ansiDim, fmt.Sprintf("  … %d more", len(cands)-i)))
-			break
-		}
-		rows = append(rows, "  "+c.Label)
+	for i := top; i < len(cands) && i < top+maxSuggestions; i++ {
+		rows = append(rows, "  "+cands[i].Label)
 	}
 	return append(rows, paint(ansiDim, "  "+completionHint))
 }
 
-// moveSelection walks the highlight down (delta 1) or up (-1) the visible
-// matches, wrapping at both ends like a search box. Nothing highlighted
-// yet: down takes the first row, up takes the last.
+// moveSelection walks the highlight down (delta 1) or up (-1) through
+// every match — including ones past the visible window, which scrolls to
+// keep the highlight on screen — wrapping at both ends like a search box.
+// Nothing highlighted yet: down takes the first row, up takes the last.
 func (e *lineEditor) moveSelection(delta int) {
-	selectable := e.selectable()
-	if selectable == 0 {
+	cands := e.candidates()
+	if len(cands) == 0 {
 		e.sel = -1
 		return
 	}
 	if e.sel < 0 {
 		if delta > 0 {
 			e.sel = 0
-			return
+		} else {
+			e.sel = len(cands) - 1
 		}
-		e.sel = selectable - 1
-		return
+	} else {
+		e.sel = (e.sel + delta + len(cands)) % len(cands)
 	}
-	e.sel = (e.sel + delta + selectable) % selectable
+	e.scrollIntoView()
+}
+
+// scrollIntoView shifts the top of the visible window so the highlighted
+// candidate is among the maxSuggestions rows on screen.
+func (e *lineEditor) scrollIntoView() {
+	if e.sel < e.top {
+		e.top = e.sel
+	}
+	if e.sel >= e.top+maxSuggestions {
+		e.top = e.sel - maxSuggestions + 1
+	}
+}
+
+// clampTop keeps the window's top inside the current candidate list —
+// typing narrows the list after the window has scrolled down.
+func (e *lineEditor) clampTop(cands []completion) {
+	if limit := len(cands) - maxSuggestions; e.top > limit {
+		if limit < 0 {
+			limit = 0
+		}
+		e.top = limit
+	}
+	if e.top < 0 {
+		e.top = 0
+	}
 }
 
 // applySelection replaces the word being typed with the highlighted
 // candidate, reporting whether there was one.
 func (e *lineEditor) applySelection() bool {
 	cands := e.candidates()
-	if e.sel < 0 || e.sel >= len(cands) || e.sel >= maxSuggestions {
+	if e.sel < 0 || e.sel >= len(cands) {
 		return false
 	}
 	word := lastWord(string(e.line))
 	e.line = []byte(string(e.line[:len(e.line)-len(word)]) + cands[e.sel].Value)
 	e.sel = -1
 	return true
-}
-
-// selectable is how many of the matches the arrows can reach.
-func (e *lineEditor) selectable() int {
-	cands := e.candidates()
-	if len(cands) > maxSuggestions {
-		return maxSuggestions
-	}
-	return len(cands)
 }
 
 // promptColumns is the printed width of a prompt: ANSI colors take no
