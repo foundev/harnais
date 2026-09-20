@@ -27,6 +27,7 @@ func run(args []string) int {
 	printMode := fs.String("p", "", "Run one non-interactive prompt and exit, e.g. -p \"fix the failing test\" (so flags can follow the prompt).")
 	apiKey := fs.String("key", "", "API key (not used by the codex backend, which reads the Codex login).")
 	effort := fs.String("effort", "", "Reasoning effort: low, medium or high (sent to all backends).")
+	resume := fs.Bool("resume", false, "Continue the most recent saved session (interactive mode only).")
 	noSandbox := fs.Bool("no-sandbox", false, "Run bash without the OS sandbox (macOS Seatbelt).")
 	extraSystem := fs.String("system", "", "Extra system instructions for the agent.")
 	showVersion := fs.Bool("version", false, "Print version and exit.")
@@ -58,6 +59,8 @@ Environment:
   CODEX_BASE_URL       Codex backend root (default %s).
 
 In a session, type /help for slash commands (/provider, /model, /effort, /reset, /exit).
+
+Interactive sessions are saved as they run; start the most recent one with -resume.
 `, defaultBaseURL, defaultOpenRouterBaseURL, defaultDeepSeekBaseURL, defaultOpenAIBaseURL, defaultInceptronBaseURL, defaultCodexBaseURL)
 	}
 	if err := fs.Parse(args); err != nil {
@@ -128,6 +131,15 @@ In a session, type /help for slash commands (/provider, /model, /effort, /reset,
 	// lazily on the first prompt (or eagerly by /provider), so no key is
 	// needed just to open the REPL.
 	sess := &session{provider: provider, cfg: cfg, keyFlag: *apiKey, configPath: cfgPath}
+	if *resume {
+		st, path, err := latestSession("")
+		if err != nil {
+			printErr("%v", err)
+			return 2
+		}
+		applySessionState(sess, st, path)
+		report("resumed %s — %s (%d messages)", path, sess.provider+"/"+sess.cfg.model, len(sess.history))
+	}
 	return repl(ctx, sess, in, report)
 }
 
@@ -237,6 +249,11 @@ type session struct {
 	provider string
 	cfg      config
 	history  []message
+	// savePath is where the session is written for -resume; "" disables
+	// saving. saved records whether the first successful save was
+	// reported, so the path is announced once, not after every turn.
+	savePath string
+	saved    bool
 	// keyFlag is the startup -key, used for the initial backend only;
 	// switching providers falls back to environment credentials.
 	keyFlag string
@@ -309,13 +326,33 @@ func handleSlash(sess *session, line string, report progressFunc) (handled, exit
 	case "/reset":
 		sess.history = nil
 		report("conversation reset")
+	case "/resume":
+		// Load the most recent other session into this one. The live
+		// session is excluded so /resume never just reloads itself, and
+		// the current conversation is saved first so it stays resumable
+		// after you switch away.
+		if sess.history != nil && sess.savePath != "" {
+			if err := saveSession(sess); err != nil {
+				report("%s", paint(ansiYellow, fmt.Sprintf("could not save the current session before switching: %v", err)))
+			}
+		}
+		st, path, err := latestSession(sess.savePath)
+		if err != nil {
+			report("%s", paint(ansiYellow, fmt.Sprintf("cannot resume: %v", err)))
+			break
+		}
+		applySessionState(sess, st, path)
+		report("%s", paint(ansiGreen, fmt.Sprintf("resumed %s — %s (%d messages)", filepath.Base(path), sess.provider+"/"+sess.cfg.model, len(sess.history))))
 	case "/help":
 		report(`Prompts go straight to the model. Commands:
   /provider [name]   show or switch backend (anthropic, openrouter, deepseek, openai, inceptron, codex); switching saves provider and model as the default for next launch and keeps history
   /model [id]        show or set the model id (saved as default)
   /effort [level]    show or set reasoning effort: low, medium, high, default (saved as default; sent to all backends)
   /reset             clear conversation history
-  /exit              leave`)
+  /resume            load the most recent saved session (excluding this one)
+  /exit              leave
+
+Sessions auto-save as they run; restart the latest with: harnais -resume`)
 	case "/provider":
 		if len(fields) < 2 {
 			report("provider: %s (model %s, effort %s)", sess.provider, sess.cfg.model, describeEffort(sess))
@@ -485,7 +522,7 @@ func listModels(ctx context.Context, sender messageSender, provider string) ([]s
 
 // slashCommands, providerNames, and effortLevels feed live completion.
 var (
-	slashCommands = []string{"/effort", "/exit", "/help", "/model", "/provider", "/quit", "/reset"}
+	slashCommands = []string{"/effort", "/exit", "/help", "/model", "/provider", "/quit", "/reset", "/resume"}
 	providerNames = []string{"anthropic", "codex", "deepseek", "inceptron", "openai", "openrouter"}
 	effortLevels  = []string{"default", "high", "low", "medium"}
 )
@@ -682,6 +719,22 @@ func repl(ctx context.Context, sess *session, in *bufio.Reader, report progressF
 		// prompt resumes the task instead of starting it over.
 		if updated != nil {
 			sess.history = updated
+			// Persist after every turn — including turns that stopped
+			// early — so -resume always picks up exactly what is on
+			// screen. The first save also assigns the fresh session its
+			// timestamped file and announces where it lives; a resumed
+			// session already has both (see applySessionState).
+			if sess.savePath == "" {
+				if p, err := newSessionPath(); err == nil {
+					sess.savePath = p
+				}
+			}
+			if err := saveSession(sess); err != nil {
+				report("%s", paint(ansiYellow, fmt.Sprintf("session not saved: %v", err)))
+			} else if !sess.saved {
+				sess.saved = true
+				report("%s", paint(ansiDim, fmt.Sprintf("session saving to %s (continue later with -resume)", sess.savePath)))
+			}
 		}
 		if err != nil {
 			printErr("%v", err)

@@ -25,8 +25,9 @@ jobs:
             linux/amd64 linux/arm64 \
             darwin/amd64 darwin/arm64 \
             windows/amd64; do
-            GOOS="${target%%/*}" GOARCH="${target##*/}" \
-              go build -trimpath \
+            GOOS="${target%%/*}"
+            GOARCH="${target##*/}"
+            go build -trimpath \
               -ldflags "-s -w -X main.version=${VERSION}" \
               -o "dist/harnais_${GOOS}_${GOARCH}" \
               .

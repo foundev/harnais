@@ -227,9 +227,29 @@ the model to retry for reviewer escalation. Other platforms currently run
 unsandboxed with a one-time warning
 (Linux confinement is the follow-up).
 
+## Sessions
+
+Interactive sessions auto-save to
+`$XDG_CONFIG_HOME/harnais/sessions/<timestamp>.json` — the full
+conversation history (prompts, tool calls, tool results) plus the backend,
+model, and effort they ran on. Writes are atomic (temp file + rename), and
+a save happens after every turn, including ones that stopped early, so the
+file always matches what is on screen. Continue the most recent session:
+
+```sh
+harnais -resume
+```
+
+Resuming restores the history and backend, and the conversation continues
+in the same REPL. Inside a session, `/resume` does the same: it saves the
+current conversation, then loads the most recent *other* session into the
+live REPL (so it never just reloads itself). Sessions that never sent a
+prompt are never written, and both paths skip empty or unreadable files.
+
 ## Layout
 
 - `main.go` — CLI flags, one-shot mode, interactive REPL
+- `session.go` — session save/load for `-resume`
 - `agent.go` — the agentic tool-use loop and system prompt
 - `anthropic.go` — Messages API client that streams (SSE over `net/http`, decoded with `encoding/json`)
 - `openai.go` — OpenAI-compatible client (OpenRouter, DeepSeek, OpenAI, Inceptron) translated onto the same loop
@@ -247,6 +267,7 @@ unsandboxed with a one-time warning
 - Integrated web search tooling
 - Image support
 - @ files to add them to the context
+- Session pickers for -resume (list, named sessions)
 - Z.ai subscription support
 
 ## License
