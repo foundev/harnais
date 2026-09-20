@@ -293,9 +293,11 @@ func latestSession(exclude ...string) (sessionState, string, error) {
 
 // replayTranscript prints a compact transcript of a resumed session, so
 // the conversation reappears on screen instead of the REPL starting from
-// a silent history. User prompts and assistant text print in full; tool
-// calls and results compress to one line each, mirroring the live
-// progress output. Thinking blocks and empty content stay silent.
+// a silent history. User prompts and assistant text print in full — the
+// text through paintAnswer, so answers keep their markdown highlighting;
+// tool calls and results compress to one line each, mirroring the live
+// progress output including its colors. Thinking blocks and empty
+// content stay silent.
 func replayTranscript(history []message, report progressFunc) {
 	report("%s", paint(ansiDim, "—— replaying transcript ———"))
 	for _, msg := range history {
@@ -316,14 +318,14 @@ func replayTranscript(history []message, report progressFunc) {
 			switch b.Type {
 			case "text":
 				if b.Text != "" {
-					report("%s", b.Text)
+					report("%s", paintAnswer(b.Text))
 				}
 			case "tool_use":
 				var input map[string]any
 				if len(b.Input) > 0 {
 					json.Unmarshal(b.Input, &input)
 				}
-				report("● %s(%s)", b.Name, summarizeInput(b.Name, input))
+				report("%s", paint(ansiCyan, fmt.Sprintf("● %s(%s)", b.Name, summarizeInput(b.Name, input))))
 			case "tool_result":
 				report("  %s", firstLine(b.Content))
 			}
