@@ -1,0 +1,48 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build binaries
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p dist
+          for target in \
+            linux/amd64 linux/arm64 \
+            darwin/amd64 darwin/arm64 \
+            windows/amd64; do
+            GOOS="${target%%/*}" GOARCH="${target##*/}" \
+              go build -trimpath \
+              -ldflags "-s -w -X main.version=${VERSION}" \
+              -o "dist/harnais_${GOOS}_${GOARCH}" \
+              .
+          done
+          cd dist
+          for f in harnais_*; do
+            if [[ "$f" == *windows* ]]; then
+              mv "$f" "$f.exe"
+              zip -q "${f}.exe.zip" "$f.exe"
+            else
+              tar -czf "$f.tar.gz" "$f"
+            fi
+          done
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
