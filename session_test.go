@@ -231,6 +231,76 @@ func TestSlashResumeWithoutSavedSessions(t *testing.T) {
 	}
 }
 
+// TestReplayTranscript checks the transcript matches the live progress
+// shape: prompts and answers in full, tool calls as "● name(input)" and
+// results as one indented line. Thinking blocks and empty content stay
+// silent, and unparsable content is skipped rather than crashing.
+func TestReplayTranscript(t *testing.T) {
+	history := []message{
+		textMessage("user", "fix the failing test"),
+		blocksMessage("assistant", []contentBlock{
+			{Type: "thinking", Thinking: "internal reasoning"},
+			{Type: "text", Text: "looking at the suite…"},
+			{Type: "tool_use", ID: "toolu_1", Name: "bash", Input: json.RawMessage(`{"command":"go test ./...","timeout":30}`)},
+		}),
+		blocksMessage("user", []contentBlock{
+			{Type: "tool_result", ToolUseID: "toolu_1", Content: "ok\nFAIL detail"},
+		}),
+		textMessage("user", "now fix it"),
+	}
+	report, got := slashReporter()
+	replayTranscript(history, report)
+	joined := strings.Join(*got, "\n")
+	want := []string{
+		"replaying transcript",
+		"· fix the failing test",
+		"looking at the suite…",
+		"● bash(go test ./...)",
+		"  ok",
+		"· now fix it",
+	}
+	for _, w := range want {
+		if !strings.Contains(joined, w) {
+			t.Errorf("transcript missing %q:\n%s", w, joined)
+		}
+	}
+	if strings.Contains(joined, "internal reasoning") {
+		t.Error("thinking blocks must not be replayed")
+	}
+	if strings.Contains(joined, "FAIL detail") {
+		t.Error("tool results must be compressed to the first line")
+	}
+	// Hand-edited files may carry anything; replay must never crash.
+	replayTranscript([]message{{Role: "assistant", Content: json.RawMessage(`[garbage`)}}, report)
+	replayTranscript(nil, report)
+}
+
+// TestResumeReplaysTranscript checks that /resume replays the loaded
+// session's conversation, so the task is back on screen before the next
+// prompt is typed.
+func TestResumeReplaysTranscript(t *testing.T) {
+	cfgDir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", cfgDir)
+	sessDir := filepath.Join(cfgDir, "harnais", "sessions")
+	os.MkdirAll(sessDir, 0o755)
+	os.WriteFile(filepath.Join(sessDir, "20240101-000000.json"), []byte(
+		`{"version":1,"provider":"anthropic","history":[{"role":"user","content":"ship the fix"}]}`), 0o644)
+
+	sess := &session{provider: "anthropic", cfg: config{model: "m"}}
+	report, got := slashReporter()
+	in := bufio.NewReader(strings.NewReader("/resume\n/exit\n"))
+	if code := repl(context.Background(), sess, in, report); code != 0 {
+		t.Fatalf("repl exited %d", code)
+	}
+	joined := strings.Join(*got, "\n")
+	if !strings.Contains(joined, "replaying transcript") {
+		t.Errorf("/resume must replay the transcript: %v", *got)
+	}
+	if !strings.Contains(joined, "ship the fix") {
+		t.Errorf("replayed transcript must show the restored conversation: %v", *got)
+	}
+}
+
 // TestApplySessionStateFallsBackFieldByField checks that a saved backend
 // harnais no longer knows (or a bad effort) cannot poison the resumed one.
 func TestApplySessionStateFallsBackFieldByField(t *testing.T) {

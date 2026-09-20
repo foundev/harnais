@@ -33,17 +33,25 @@ jobs:
               .
           done
           cd dist
+          # Archive each binary, then remove it: dist must hold only
+          # archives, or the Release step uploads every binary twice.
           for f in harnais_*; do
             if [[ "$f" == *windows* ]]; then
               mv "$f" "$f.exe"
-              zip -q "${f}.exe.zip" "$f.exe"
+              zip -q "${f}.zip" "$f.exe"
+              rm "$f.exe"
             else
               tar -czf "$f.tar.gz" "$f"
+              rm "$f"
             fi
           done
 
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*
+          # Only archives live in dist at this point (see the rm above);
+          # the glob stays narrow so a stray file cannot leak in.
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
           generate_release_notes: true

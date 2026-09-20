@@ -136,6 +136,46 @@ func latestSession(exclude ...string) (sessionState, string, error) {
 	return sessionState{}, "", fmt.Errorf("no saved session with a conversation — pass -resume after a first session exists")
 }
 
+// replayTranscript prints a compact transcript of a resumed session, so
+// the conversation reappears on screen instead of the REPL starting from
+// a silent history. User prompts and assistant text print in full; tool
+// calls and results compress to one line each, mirroring the live
+// progress output. Thinking blocks and empty content stay silent.
+func replayTranscript(history []message, report progressFunc) {
+	report("%s", paint(ansiDim, "—— replaying transcript ———"))
+	for _, msg := range history {
+		// Plain-string content is always a spoken turn: a user prompt,
+		// or (from hand-edited files) an assistant reply.
+		var text string
+		if err := json.Unmarshal(msg.Content, &text); err == nil {
+			if text != "" {
+				report("· %s", text)
+			}
+			continue
+		}
+		var blocks []contentBlock
+		if err := json.Unmarshal(msg.Content, &blocks); err != nil {
+			continue
+		}
+		for _, b := range blocks {
+			switch b.Type {
+			case "text":
+				if b.Text != "" {
+					report("%s", b.Text)
+				}
+			case "tool_use":
+				var input map[string]any
+				if len(b.Input) > 0 {
+					json.Unmarshal(b.Input, &input)
+				}
+				report("● %s(%s)", b.Name, summarizeInput(b.Name, input))
+			case "tool_result":
+				report("  %s", firstLine(b.Content))
+			}
+		}
+	}
+}
+
 // sameFile reports whether two paths name the same file: true when both
 // exist and stat to the same inode, or when their cleaned paths are equal
 // (covers not-yet-written sessions). Either path may be empty.

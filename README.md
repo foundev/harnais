@@ -240,8 +240,10 @@ file always matches what is on screen. Continue the most recent session:
 harnais -resume
 ```
 
-Resuming restores the history and backend, and the conversation continues
-in the same REPL. Inside a session, `/resume` does the same: it saves the
+Resuming restores the history and backend, replays the conversation as a
+compact transcript (full text, tool calls and results one line each), and
+the conversation continues in the same REPL. Inside a session, `/resume`
+does the same: it saves the
 current conversation, then loads the most recent *other* session into the
 live REPL (so it never just reloads itself). Sessions that never sent a
 prompt are never written, and both paths skip empty or unreadable files.

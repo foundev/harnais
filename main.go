@@ -139,6 +139,7 @@ Interactive sessions are saved as they run; start the most recent one with -resu
 		}
 		applySessionState(sess, st, path)
 		report("resumed %s — %s (%d messages)", path, sess.provider+"/"+sess.cfg.model, len(sess.history))
+		replayTranscript(sess.history, report)
 	}
 	return repl(ctx, sess, in, report)
 }
@@ -343,13 +344,14 @@ func handleSlash(sess *session, line string, report progressFunc) (handled, exit
 		}
 		applySessionState(sess, st, path)
 		report("%s", paint(ansiGreen, fmt.Sprintf("resumed %s — %s (%d messages)", filepath.Base(path), sess.provider+"/"+sess.cfg.model, len(sess.history))))
+		replayTranscript(sess.history, report)
 	case "/help":
 		report(`Prompts go straight to the model. Commands:
   /provider [name]   show or switch backend (anthropic, openrouter, deepseek, openai, inceptron, codex); switching saves provider and model as the default for next launch and keeps history
   /model [id]        show or set the model id (saved as default)
   /effort [level]    show or set reasoning effort: low, medium, high, default (saved as default; sent to all backends)
   /reset             clear conversation history
-  /resume            load the most recent saved session (excluding this one)
+  /resume            load the most recent saved session (excluding this one) and replay its transcript
   /exit              leave
 
 Sessions auto-save as they run; restart the latest with: harnais -resume`)
