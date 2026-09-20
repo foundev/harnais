@@ -148,6 +148,14 @@ and both were removed; an 8k output cap is worse than merely tight on
 thinking models, where thinking tokens count toward `max_tokens`. A reply
 the model cut off says so instead of arriving silently short.
 
+Anthropic requests stream (`"stream": true`, SSE), so a long answer keeps
+data moving instead of arriving in one burst at the end — the client holds
+no total-request deadline, only a watchdog that drops a stream which sends
+nothing for two minutes. The stream is assembled into the same message
+shape the rest of the harness speaks, so tool calls, extended-thinking
+blocks (returned byte-for-byte, as the API requires), and usage all survive
+the round trip.
+
 Default models: `claude-sonnet-4-20250514` for `-provider=anthropic`,
 `anthropic/claude-sonnet-4.5` for `-provider=openrouter`, `deepseek-flash`
 for `-provider=deepseek`, `gpt-5-mini` for `-provider=openai`,
@@ -223,7 +231,7 @@ unsandboxed with a one-time warning
 
 - `main.go` — CLI flags, one-shot mode, interactive REPL
 - `agent.go` — the agentic tool-use loop and system prompt
-- `anthropic.go` — minimal Messages API client (`net/http` + `encoding/json`)
+- `anthropic.go` — Messages API client that streams (SSE over `net/http`, decoded with `encoding/json`)
 - `openai.go` — OpenAI-compatible client (OpenRouter, DeepSeek, OpenAI, Inceptron) translated onto the same loop
 - `codex.go` — Codex subscription backend: reuses the Codex CLI login, speaks the Responses API
 - `edit.go` — raw-mode line editor with live (type-ahead) completion for the interactive REPL
