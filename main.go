@@ -143,7 +143,12 @@ Interactive sessions are saved as they run; start the most recent one with -resu
 		report("resumed %s — %s (%d messages)", path, sess.provider+"/"+sess.cfg.model, len(sess.history))
 		replayTranscript(sess.history, report)
 	}
-	return repl(ctx, sess, in, report)
+	// The REPL gets a plain context: the interrupt signal is armed per
+	// turn inside repl (see the runPrompt call there), so the shared
+	// signal context would be permanently cancelled by the first Ctrl+C
+	// and take the background model fetch with it. The one-shot path
+	// above keeps ctx, where process exit follows the turn anyway.
+	return repl(context.Background(), sess, in, report)
 }
 
 // resolvePrompt picks the one-shot prompt: -p or positional args, never
@@ -867,7 +872,15 @@ func repl(ctx context.Context, sess *session, in *bufio.Reader, report progressF
 			printErr("%v", err)
 			continue
 		}
-		answer, updated, err := runPrompt(ctx, sess.sender, sess.cfg, sess.history, prompt, report)
+		// A fresh interrupt context per turn: signal.NotifyContext is
+		// one-shot — once Ctrl+C cancels it, it stays cancelled — so
+		// reusing one context would leave every later turn dead and the
+		// prompt stuck (the handler would swallow Ctrl+C forever).
+		// Ctrl+C while typing never reaches here: the raw-mode editor
+		// reads ^C as a byte (see edit.go).
+		turnCtx, stopInterrupt := signal.NotifyContext(context.Background(), os.Interrupt)
+		answer, updated, err := runPrompt(turnCtx, sess.sender, sess.cfg, sess.history, prompt, report)
+		stopInterrupt()
 		// Keep the turn's work even when it stopped early: the tool results
 		// in `updated` are the only record of what it did, so the next
 		// prompt resumes the task instead of starting it over.
@@ -891,7 +904,12 @@ func repl(ctx context.Context, sess *session, in *bufio.Reader, report progressF
 			}
 		}
 		if err != nil {
-			printErr("%v", err)
+			// An interrupted turn is not a failure: say so plainly.
+			if errors.Is(err, context.Canceled) {
+				report("%s", paint(ansiYellow, "^C — turn stopped, work kept"))
+			} else {
+				printErr("%v", err)
+			}
 			continue
 		}
 		fmt.Println(paintAnswer(answer))

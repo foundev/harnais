@@ -5,8 +5,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -199,6 +203,100 @@ func TestReplKeepsTheTurnWhenItStops(t *testing.T) {
 	if blob := requestJSON(t, messageRequest{Messages: sess.history}); !strings.Contains(blob, "denied") {
 		t.Errorf("the stopped turn must keep its tool results: %s", blob)
 	}
+}
+
+func TestReplFreshInterruptContextEachTurn(t *testing.T) {
+	// Ctrl+C stops a turn by cancelling the turn's context. signal.Notify
+	// is one-shot — once fired, that context stays cancelled — so the repl
+	// must arm a fresh one per turn. The regression this pins: with a
+	// single shared context, the first ^C kills the turn and every later
+	// turn fails instantly with "context canceled".
+	if runtime.GOOS == "windows" {
+		t.Skip("no syscall.Kill on windows")
+	}
+	started := make(chan struct{}, 1)
+	calls := make(chan ctxErr, 8)
+	sender := &interruptSender{started: started, calls: calls}
+	sess := &session{sender: sender, provider: "anthropic", cfg: config{model: "m"}}
+	report, got := slashReporter()
+	in := bufio.NewReader(strings.NewReader("first\nsecond\n/exit\n"))
+	replDone := make(chan int, 1)
+	go func() { replDone <- repl(context.Background(), sess, in, report) }()
+
+	// Turn 1: wait until the model call (and its signal handler) is live,
+	// then deliver SIGINT the way the terminal does during a turn.
+	<-started
+	if err := syscall.Kill(os.Getpid(), syscall.SIGINT); err != nil {
+		t.Fatalf("send SIGINT: %v", err)
+	}
+	ctx1 := <-calls
+	if ctx1.errAtStart == nil {
+		// The kill lands asynchronously; give it a moment.
+		select {
+		case <-ctx1.ctx.Done():
+		case <-time.After(2 * time.Second):
+			t.Error("interrupt did not cancel the first turn's context")
+		}
+	}
+
+	// Turn 2 must start on a live context and reach its answer. Check the
+	// error captured when the call began: stopInterrupt cancels the turn
+	// context again once the turn is over, so a later read lies.
+	ctx2 := <-calls
+	if ctx2.errAtStart != nil {
+		t.Fatalf("second turn got a dead context: %v (repl is stuck)", ctx2.errAtStart)
+	}
+	select {
+	case code := <-replDone:
+		if code != 0 {
+			t.Fatalf("repl exit = %d, want 0", code)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("repl did not finish; a later turn likely failed on the cancelled context")
+	}
+	joined := strings.Join(*got, "\n")
+	if !strings.Contains(joined, "^C") {
+		t.Errorf("an interrupted turn must be reported, got: %v", *got)
+	}
+	if strings.Contains(joined, "context canceled") {
+		t.Errorf("the interrupt must not surface as an error: %v", *got)
+	}
+	// Turn 1 left its user message; turn 2 added its own plus the answer.
+	if blob := requestJSON(t, messageRequest{Messages: sess.history}); !strings.Contains(blob, `"first"`) || !strings.Contains(blob, `"second"`) || !strings.Contains(blob, "done") {
+		t.Errorf("both turns should be in the history: %s", blob)
+	}
+}
+
+// ctxErr pairs a model call's context with its error state at call time,
+// because a turn context is cancelled again (deliberately) once the turn
+// ends and any later read would misreport it as dead.
+type ctxErr struct {
+	ctx        context.Context
+	errAtStart error
+}
+
+// interruptSender scripts two turns: the first blocks until its context is
+// cancelled (what an interrupted API call does) and reports the error; the
+// second succeeds. It hands each call's context to the test over calls.
+type interruptSender struct {
+	started chan struct{}
+	calls   chan ctxErr
+	n       atomic.Int32
+}
+
+func (s *interruptSender) createMessage(ctx context.Context, _ messageRequest) (*messageResponse, error) {
+	s.calls <- ctxErr{ctx, ctx.Err()}
+	if s.n.Add(1) > 1 {
+		// The second turn must run to completion on its fresh context.
+		return &messageResponse{
+			ID:         "msg_2",
+			Content:    []contentBlock{{Type: "text", Text: "done"}},
+			StopReason: "end_turn",
+		}, nil
+	}
+	s.started <- struct{}{}
+	<-ctx.Done() // first call: sit until the interrupt lands
+	return nil, ctx.Err()
 }
 
 func TestReplCompleter(t *testing.T) {
