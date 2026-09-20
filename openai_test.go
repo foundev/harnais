@@ -26,8 +26,13 @@ func TestOpenRouterRequestTranslation(t *testing.T) {
 	}
 	chat := toChatRequest(req, false)
 
-	if chat.Model != req.Model || chat.MaxTokens != req.MaxTokens {
-		t.Fatalf("model/tokens not carried over: %+v", chat)
+	if chat.Model != req.Model {
+		t.Fatalf("model not carried over: %+v", chat)
+	}
+	if raw, err := json.Marshal(chat); err != nil {
+		t.Fatal(err)
+	} else if strings.Contains(string(raw), "max_tokens") {
+		t.Errorf("the chat wire shape must carry no output cap: %s", raw)
 	}
 	if len(chat.Messages) != 4 {
 		t.Fatalf("expected 4 chat messages, got %d: %+v", len(chat.Messages), chat.Messages)
@@ -251,8 +256,8 @@ func TestChatEmptyResponseErrors(t *testing.T) {
 	}
 	raw = []byte(`{"id":"gen_6","choices":[{"message":{"role":"assistant","content":""},"finish_reason":"length"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
 	if _, err := decodeChatResponse(200, raw, false); err == nil ||
-		!strings.Contains(err.Error(), "max-tokens") {
-		t.Errorf("empty length cut must suggest raising max-tokens, got %v", err)
+		!strings.Contains(err.Error(), "output limit") {
+		t.Errorf("an empty length cut must say the model ran out of output, got %v", err)
 	}
 }
 
@@ -376,7 +381,7 @@ func TestInceptronReasoningFieldFallback(t *testing.T) {
 	}
 	// Same body on a non-inceptron backend keeps the loud error.
 	if _, err := decodeChatResponse(200, raw, false); err == nil ||
-		!strings.Contains(err.Error(), "max-tokens") {
+		!strings.Contains(err.Error(), "output limit") {
 		t.Errorf("other backends must not use the reasoning field, got %v", err)
 	}
 	// Content still wins when present.
@@ -427,26 +432,19 @@ func TestDecodeModelsList(t *testing.T) {
 	}
 }
 
-func TestChatRequestOmitsMaxTokensWhenUncapped(t *testing.T) {
-	// OpenAI-compatible backends get no output cap from harnais: the field
-	// is dropped when nothing was asked for, so the backend decides — the
-	// same thing Codex does, whose sampling request carries no output-token
-	// field at all.
-	wire := func(maxTokens int) string {
-		raw, err := json.Marshal(toChatRequest(messageRequest{
-			Model:     "m",
-			MaxTokens: maxTokens,
-			Messages:  []message{textMessage("user", "hi")},
-		}, false))
-		if err != nil {
-			t.Fatal(err)
-		}
-		return string(raw)
+func TestChatRequestCarriesNoOutputCap(t *testing.T) {
+	// OpenAI-compatible backends get no output cap from harnais: the wire
+	// shape has no max_tokens field at all, so the backend decides how long
+	// a reply may be — the same thing Codex does, whose sampling request
+	// carries no output-token field either.
+	raw, err := json.Marshal(toChatRequest(messageRequest{
+		Model:    "m",
+		Messages: []message{textMessage("user", "hi")},
+	}, false))
+	if err != nil {
+		t.Fatal(err)
 	}
-	if blob := wire(0); strings.Contains(blob, "max_tokens") {
-		t.Errorf("an uncapped request must not carry max_tokens: %s", blob)
-	}
-	if blob := wire(4096); !strings.Contains(blob, `"max_tokens":4096`) {
-		t.Errorf("an explicit cap must reach the wire: %s", blob)
+	if blob := string(raw); strings.Contains(blob, "max_tokens") {
+		t.Errorf("the chat request must carry no max_tokens: %s", blob)
 	}
 }

@@ -67,10 +67,8 @@ harnais -provider=inceptron "explain what main.go does"
 ```
 
 Its GLM models are reasoning models: they can think past 8k output tokens
-before the first visible character, which is why harnais leaves output
-uncapped by default (see `-max-tokens` below). Truncated responses expose
-their chain of thought as `message.reasoning`, which the harness surfaces
-as text.
+before the first visible character. Truncated responses expose their chain
+of thought as `message.reasoning`, which the harness surfaces as text.
 
 Or bill your ChatGPT subscription through the Codex login you already have —
 no API key needed. Auth is Codex's job (`codex login` / `codex logout`);
@@ -135,29 +133,20 @@ override the saved values for one run without changing them.
 | `-model`       | saved, else per-provider (see below) | Model ID for this run (`ANTHROPIC_MODEL` overrides the default) |
 | `-key`         | per-provider env var           | API key                                        |
 | `-effort`      | saved, else `""`               | Reasoning effort for this run: `low`, `medium`, `high` (all backends) |
-| `-n`           | `0` (no cap)                   | Optional cap on model round-trips per prompt   |
-| `-max-tokens`  | `0` (no cap)                   | Optional cap on the tokens in one model response |
 | `-no-sandbox`  | `false`                        | Run `bash` without the OS sandbox              |
 | `-system`      | `""`                           | Extra system instructions                      |
 | `-version`     | —                              | Print version and exit                         |
 
-Model responses are uncapped by default. Anthropic's Messages API takes a
-`max_tokens` number, so harnais sends 128K there — the largest output
-current Claude models allow, and what "uncapped" means for that API.
-Every other backend (openrouter, deepseek, openai, inceptron, codex) sends
-no output-token field at all, exactly like Codex's own sampling request.
-An 8k ceiling used to sit in front of all of them; on thinking models that
-is not a small cap but a broken one, since thinking tokens count toward
-`max_tokens`. An explicit `-max-tokens N` overrides the number wherever a
-backend takes one, and a reply that gets cut off says so instead of
-arriving silently short.
-
-Turns are uncapped by default: a prompt runs until the model stops asking
-for tools, the way Codex CLI ends a turn, so long tasks can run for as long
-as they need to. `-n N` opts into a budget of N model round-trips if you
-want a hard stop; reaching it is a soft stop rather than a failure — the
-turn keeps its tool results in the session and says so, so your next
-message carries on from where it stopped.
+There are no caps to configure. A prompt runs until the model stops asking
+for tools, the way Codex CLI ends a turn, so long tasks run for as long as
+they need to. A model response runs to the model's own output limit:
+harnais sends no output-token field to any backend, exactly like Codex's
+own sampling request, with one exception — Anthropic's Messages API takes a
+`max_tokens` number, so harnais sends 128K there, the largest output current
+Claude models allow. Both ceilings used to exist as `-n` and `-max-tokens`
+and both were removed; an 8k output cap is worse than merely tight on
+thinking models, where thinking tokens count toward `max_tokens`. A reply
+the model cut off says so instead of arriving silently short.
 
 Default models: `claude-sonnet-4-20250514` for `-provider=anthropic`,
 `anthropic/claude-sonnet-4.5` for `-provider=openrouter`, `deepseek-flash`

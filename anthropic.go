@@ -50,7 +50,10 @@ func blocksMessage(role string, blocks []contentBlock) message {
 }
 
 type messageRequest struct {
-	Model     string           `json:"model"`
+	Model string `json:"model"`
+	// MaxTokens exists for the one backend that insists on a number:
+	// Anthropic's Messages API. Nothing else sets it, and the OpenAI-shaped
+	// wire struct has no such field at all (see toChatRequest).
 	MaxTokens int              `json:"max_tokens"`
 	System    string           `json:"system,omitempty"`
 	Messages  []message        `json:"messages"`
@@ -95,9 +98,9 @@ func newAnthropicClient(apiKey, baseURL string) *anthropicClient {
 	}
 }
 
-// anthropicMaxOutputTokens is the max_tokens harnais asks for when no
-// -max-tokens is set: the Messages API takes a number, so "uncapped" is
-// expressed as the largest output current Claude models allow (128K).
+// anthropicMaxOutputTokens is the max_tokens every request carries: the
+// Messages API takes a number, so "uncapped" is expressed as the largest
+// output current Claude models allow (128K).
 const anthropicMaxOutputTokens = 128000
 
 // buildAnthropicRequest projects harness-internal effort onto the wire

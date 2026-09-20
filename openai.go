@@ -182,7 +182,7 @@ func decodeChatResponse(status int, raw []byte, readReasoningField bool) (*messa
 		// with no error. Fail loudly, naming the finish reason so a
 		// length cut carries its own remedy.
 		if fr := chat.Choices[0].FinishReason; fr == "length" {
-			return nil, fmt.Errorf("api error: model returned no content (finish_reason %q) — output hit the token limit; retry with a higher -max-tokens", fr)
+			return nil, fmt.Errorf("api error: model returned no content (finish_reason %q) — it ran into its output limit before writing anything; ask for a shorter answer or split the request", fr)
 		}
 		return nil, fmt.Errorf("api error: model returned no content (finish_reason %q)", chat.Choices[0].FinishReason)
 	}
@@ -226,8 +226,9 @@ type chatFunction struct {
 }
 
 type chatRequest struct {
-	Model           string        `json:"model"`
-	MaxTokens       int           `json:"max_tokens,omitempty"`
+	Model string `json:"model"`
+	// Deliberately no max_tokens: OpenAI-compatible backends get no output
+	// cap from harnais, so the backend decides how long a reply may be.
 	ReasoningEffort *string       `json:"reasoning_effort,omitempty"`
 	Messages        []chatMessage `json:"messages"`
 	Tools           []chatTool    `json:"tools,omitempty"`
@@ -255,7 +256,7 @@ type chatResponse struct {
 // is set (DeepSeek thinking mode with tools requires the full chain back;
 // other backends must not see the field).
 func toChatRequest(req messageRequest, echoReasoning bool) chatRequest {
-	out := chatRequest{Model: req.Model, MaxTokens: req.MaxTokens}
+	out := chatRequest{Model: req.Model}
 	if req.Effort != "" {
 		effort := req.Effort
 		out.ReasoningEffort = &effort

@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -17,21 +16,6 @@ import (
 
 const version = "0.1.0"
 
-// defaultMaxIters is the agent loop's per-prompt budget out of the box:
-// none. A turn ends when the model stops asking for tools, the way Codex
-// CLI ends one, so a long task can run for as long as it needs to. -n N
-// opts into a budget for anyone who wants a hard stop.
-const defaultMaxIters = 0
-
-// defaultMaxTokens is how long one model response may be unless -max-tokens
-// says otherwise: unbounded. Capping a reply at an arbitrary number throws
-// away the work that produced it and cuts off exactly the long answers
-// people ask for, so the backend decides. Codex sends no output-token cap
-// at all (see ResponsesApiRequest in codex-api), and neither do we.
-// Anthropic's Messages API requires a number, so that client asks for the
-// model's own ceiling instead (see maxTokensFor).
-const defaultMaxTokens = 0
-
 func main() {
 	os.Exit(run(os.Args[1:]))
 }
@@ -42,9 +26,7 @@ func run(args []string) int {
 	model := fs.String("model", envOr("ANTHROPIC_MODEL", ""), "Model ID (default depends on the saved provider).")
 	printMode := fs.String("p", "", "Run one non-interactive prompt and exit, e.g. -p \"fix the failing test\" (so flags can follow the prompt).")
 	apiKey := fs.String("key", "", "API key (not used by the codex backend, which reads the Codex login).")
-	maxTokens := fs.Int("max-tokens", defaultMaxTokens, "Cap one model response (0 = no cap: 128K for anthropic, no field for the rest).")
 	effort := fs.String("effort", "", "Reasoning effort: low, medium or high (sent to all backends).")
-	maxIters := fs.Int("n", defaultMaxIters, "Max model round-trips per prompt (0 = no cap).")
 	noSandbox := fs.Bool("no-sandbox", false, "Run bash without the OS sandbox (macOS Seatbelt).")
 	extraSystem := fs.String("system", "", "Extra system instructions for the agent.")
 	showVersion := fs.Bool("version", false, "Print version and exit.")
@@ -85,10 +67,6 @@ In a session, type /help for slash commands (/provider, /model, /effort, /reset,
 		fmt.Printf("harnais %s\n", version)
 		return 0
 	}
-	if *maxIters < 0 {
-		fmt.Fprintln(os.Stderr, "harnais: -n cannot be negative (use 0 for no cap).")
-		return 2
-	}
 	if *effort != "" && !validEffort(*effort) {
 		fmt.Fprintln(os.Stderr, "harnais: -effort must be low, medium or high.")
 		return 2
@@ -114,8 +92,6 @@ In a session, type /help for slash commands (/provider, /model, /effort, /reset,
 	cfg := config{
 		// Flags win for this run; the saved triple is the default.
 		model:       firstNonEmpty(*model, stored.Model, defModel),
-		maxTokens:   *maxTokens,
-		maxIters:    *maxIters,
 		extraSystem: *extraSystem,
 		effort:      firstNonEmpty(*effort, stored.Effort),
 		sandbox:     !*noSandbox,
@@ -151,7 +127,7 @@ In a session, type /help for slash commands (/provider, /model, /effort, /reset,
 	// Sessions start without touching any credential: the backend is built
 	// lazily on the first prompt (or eagerly by /provider), so no key is
 	// needed just to open the REPL.
-	sess := &session{provider: provider, cfg: cfg, keyFlag: *apiKey, maxTokensFlag: *maxTokens, configPath: cfgPath}
+	sess := &session{provider: provider, cfg: cfg, keyFlag: *apiKey, configPath: cfgPath}
 	return repl(ctx, sess, in, report)
 }
 
@@ -264,9 +240,6 @@ type session struct {
 	// keyFlag is the startup -key, used for the initial backend only;
 	// switching providers falls back to environment credentials.
 	keyFlag string
-	// maxTokensFlag is the raw startup -max-tokens (0 = provider
-	// default), kept so /provider can re-resolve the cap per backend.
-	maxTokensFlag int
 	// configPath persists /provider switches; "" disables persistence.
 	configPath string
 	// The model list feeds the editor's live completion.
@@ -358,7 +331,6 @@ func handleSlash(sess *session, line string, report progressFunc) (handled, exit
 		// editor warms it again as soon as the next line is typed.
 		sess.setProvider(fields[1])
 		sess.cfg.model = model
-		sess.cfg.maxTokens = sess.maxTokensFlag
 		persistSession(sess, report, fmt.Sprintf("provider: %s, model reset to %s (history kept)", sess.provider, model))
 	case "/model":
 		if len(fields) < 2 {
@@ -710,11 +682,6 @@ func repl(ctx context.Context, sess *session, in *bufio.Reader, report progressF
 		// prompt resumes the task instead of starting it over.
 		if updated != nil {
 			sess.history = updated
-		}
-		var capErr iterationCapError
-		if errors.As(err, &capErr) {
-			report("%s", paint(ansiYellow, capErr.Error()))
-			continue
 		}
 		if err != nil {
 			printErr("%v", err)

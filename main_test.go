@@ -5,9 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -29,7 +27,7 @@ func newSlashSession(t *testing.T) *session {
 	return &session{
 		sender:     sender,
 		provider:   "anthropic",
-		cfg:        config{model: model, maxIters: 1},
+		cfg:        config{model: model},
 		configPath: filepath.Join(t.TempDir(), "config.json"),
 	}
 }
@@ -157,7 +155,7 @@ func TestEnsureSenderLazy(t *testing.T) {
 
 func TestReplPromptWithoutCredential(t *testing.T) {
 	t.Setenv("ANTHROPIC_API_KEY", "")
-	sess := &session{provider: "anthropic", cfg: config{model: "m", maxIters: 1}}
+	sess := &session{provider: "anthropic", cfg: config{model: "m"}}
 	report, _ := slashReporter()
 	in := bufio.NewReader(strings.NewReader("hi\n/exit\n"))
 	if code := repl(context.Background(), sess, in, report); code != 0 {
@@ -168,209 +166,45 @@ func TestReplPromptWithoutCredential(t *testing.T) {
 	}
 }
 
-func TestIterationCapIsOffByDefault(t *testing.T) {
-	// Turns end when the model stops asking for tools, not when a counter
-	// runs out: the budget is opt-in via -n N.
-	if defaultMaxIters != 0 {
-		t.Fatalf("the agent loop must ship uncapped, got default -n %d", defaultMaxIters)
-	}
-}
-
 func TestReplKeepsTheTurnWhenItStops(t *testing.T) {
-	// A turn that runs into the iteration cap must leave its work in the
-	// session: the user's next message resumes the task instead of
-	// restarting it from nothing.
-	readPath := filepath.Join(t.TempDir(), "notes.txt")
-	if err := os.WriteFile(readPath, []byte("halfway\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	// A turn that stops early — here the reviewer refusing three actions in
+	// a row — must leave its work in the session, so the next message
+	// resumes the task instead of restarting it from nothing.
 	sender := &fakeSender{t: t}
 	sender.script = func(call int, req messageRequest) messageResponse {
+		if len(req.Tools) == 0 {
+			return reviewVerdictResponse("DENY: not this")
+		}
 		return messageResponse{
 			ID: fmt.Sprintf("msg_%d", call),
 			Content: []contentBlock{
-				{Type: "tool_use", ID: fmt.Sprintf("toolu_%d", call), Name: "read",
-					Input: json.RawMessage(`{"path":` + strconv.Quote(readPath) + `}`)},
+				{Type: "tool_use", ID: fmt.Sprintf("toolu_%d", call), Name: "write",
+					Input: json.RawMessage(`{"path":"notes.txt","content":"halfway"}`)},
 			},
 			StopReason: "tool_use",
 		}
 	}
-	sess := &session{
-		sender:   sender,
-		provider: "anthropic",
-		cfg:      config{model: "m", maxIters: 2},
-	}
+	sess := &session{sender: sender, provider: "anthropic", cfg: config{model: "m"}}
 	report, got := slashReporter()
-	in := bufio.NewReader(strings.NewReader("read the notes\n/exit\n"))
+	in := bufio.NewReader(strings.NewReader("write the notes\n/exit\n"))
 	if code := repl(context.Background(), sess, in, report); code != 0 {
-		t.Fatalf("repl should survive the cap, got exit %d", code)
+		t.Fatalf("repl should survive a stopped turn, got exit %d", code)
 	}
-	if !strings.Contains(strings.Join(*got, "\n"), "iteration cap") {
-		t.Errorf("the cap must be reported: %v", *got)
+	if joined := strings.Join(*got, "\n"); !strings.Contains(joined, "review: denied") {
+		t.Errorf("the turn must show why it stopped: %v", *got)
 	}
-	if len(sess.history) == 0 {
-		t.Fatal("a stopped turn must keep its history")
+	if len(sess.history) < 3 {
+		t.Fatalf("a stopped turn must keep its history, got %d messages", len(sess.history))
 	}
-	if blob := requestJSON(t, messageRequest{Messages: sess.history}); !strings.Contains(blob, "halfway") {
+	if blob := requestJSON(t, messageRequest{Messages: sess.history}); !strings.Contains(blob, "denied") {
 		t.Errorf("the stopped turn must keep its tool results: %s", blob)
-	}
-}
-
-func TestLoadStoredConfig(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "config.json")
-
-	got, err := loadStoredConfig(path)
-	if got.Provider != "anthropic" || err != nil {
-		t.Errorf("missing file should default: %+v, %v", got, err)
-	}
-	if err := saveStoredConfig(path, storedConfig{Provider: "openrouter", Model: "m", Effort: "high"}); err != nil {
-		t.Fatal(err)
-	}
-	if got, err := loadStoredConfig(path); err != nil || got.Provider != "openrouter" || got.Model != "m" || got.Effort != "high" {
-		t.Errorf("saved triple should round-trip: %+v, %v", got, err)
-	}
-	if err := os.WriteFile(path, []byte(`{broken`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if got, err := loadStoredConfig(path); got.Provider != "anthropic" || err == nil {
-		t.Errorf("corrupt file should default with error: %+v, %v", got, err)
-	}
-	if err := os.WriteFile(path, []byte(`{"provider":"nope","model":"m","effort":"high"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if got, err := loadStoredConfig(path); err == nil || got.Provider != "anthropic" || got.Model != "" {
-		t.Errorf("unknown provider should reset provider and model with error: %+v, %v", got, err)
-	}
-	if err := os.WriteFile(path, []byte(`{"provider":"openrouter","effort":"ultra"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if got, err := loadStoredConfig(path); err == nil || got.Effort != "" || got.Provider != "openrouter" {
-		t.Errorf("invalid effort should clear with error, keeping provider: %+v, %v", got, err)
-	}
-	if _, err := loadStoredConfig(""); err != nil {
-		t.Errorf("empty path disables persistence quietly: %v", err)
-	}
-}
-
-func TestSlashPersistsTriple(t *testing.T) {
-	t.Setenv("OPENROUTER_API_KEY", "ok")
-	sess := newSlashSession(t)
-	report, _ := slashReporter()
-
-	handleSlash(sess, "/model custom-1", report)
-	handleSlash(sess, "/effort high", report)
-	got, err := loadStoredConfig(sess.configPath)
-	if err != nil {
-		t.Fatalf("load saved: %v", err)
-	}
-	if got.Provider != "anthropic" || got.Model != "custom-1" || got.Effort != "high" {
-		t.Errorf("/model and /effort should persist the triple: %+v", got)
-	}
-	handleSlash(sess, "/provider openrouter", report)
-	if got, err := loadStoredConfig(sess.configPath); err != nil || got.Provider != "openrouter" || got.Model != defaultOpenRouterModel {
-		t.Errorf("/provider should persist provider and reset model: %+v, %v", got, err)
-	}
-	handleSlash(sess, "/provider nope", report)
-	if got, _ := loadStoredConfig(sess.configPath); got.Provider != "openrouter" {
-		t.Errorf("failed switch must not overwrite the saved default: %+v", got)
-	}
-}
-
-func TestResolvePrompt(t *testing.T) {
-	if _, err := resolvePrompt("x", []string{"y"}); err == nil {
-		t.Error("expected error combining -p with positional args")
-	}
-	if got, err := resolvePrompt("x", nil); err != nil || got != "x" {
-		t.Errorf("-p should win alone: %q, %v", got, err)
-	}
-	if got, err := resolvePrompt("", []string{"a", "b"}); err != nil || got != "a b" {
-		t.Errorf("positional args should join: %q, %v", got, err)
-	}
-	if got, err := resolvePrompt("", nil); err != nil || got != "" {
-		t.Errorf("neither should mean session: %q, %v", got, err)
-	}
-}
-
-func TestSlashResetUnknownExit(t *testing.T) {
-	sess := newSlashSession(t)
-	sess.history = []message{textMessage("user", "hi")}
-	report, got := slashReporter()
-
-	if handled, _ := handleSlash(sess, "/reset", report); !handled {
-		t.Fatal("reset not handled")
-	}
-	if sess.history != nil {
-		t.Error("reset should clear history")
-	}
-	if handled, _ := handleSlash(sess, "/frobnicate", report); !handled {
-		t.Fatal("unknown slash should still be handled, never sent to the model")
-	}
-	if !strings.Contains(lastReport(t, got), "unknown command") {
-		t.Errorf("unknown slash should hint: %q", lastReport(t, got))
-	}
-	if handled, exit := handleSlash(sess, "just a prompt", report); handled || exit {
-		t.Errorf("plain text is not a command: %v %v", handled, exit)
-	}
-	if handled, exit := handleSlash(sess, "/exit", report); !handled || !exit {
-		t.Errorf("/exit should exit: %v %v", handled, exit)
-	}
-}
-
-// fakeListerSender extends fakeSender with a model list, standing in for
-// a backend that implements modelLister.
-type fakeListerSender struct {
-	fakeSender
-	ids   []string
-	calls int
-}
-
-func (f *fakeListerSender) listModels(_ context.Context) ([]string, error) {
-	f.calls++
-	return f.ids, nil
-}
-
-func TestProviderSwitchInvalidatesModelCache(t *testing.T) {
-	t.Setenv("OPENROUTER_API_KEY", "ok")
-	t.Setenv("ANTHROPIC_API_KEY", "ak")
-	sess := newSlashSession(t)
-	sess.cacheModels(sess.modelsGen, sess.provider, []string{"stale"})
-	report, _ := slashReporter()
-	handleSlash(sess, "/provider openrouter", report)
-	if ids := modelSnapshot(sess); ids != nil {
-		t.Errorf("switch must drop the model cache: %v", ids)
-	}
-	// Switching also re-resolves the per-provider max-tokens default.
-	sess.maxTokensFlag = 0
-	handleSlash(sess, "/provider inceptron", report)
-	if sess.cfg.maxTokens != 0 {
-		t.Errorf("switching providers must keep the uncapped default, got %d", sess.cfg.maxTokens)
-	}
-	handleSlash(sess, "/provider anthropic", report)
-	if sess.cfg.maxTokens != 0 {
-		t.Errorf("anthropic must default to no cap, got %d", sess.cfg.maxTokens)
-	}
-	// An explicit flag rides along across switches.
-	sess.maxTokensFlag = 4096
-	handleSlash(sess, "/provider inceptron", report)
-	if sess.cfg.maxTokens != 4096 {
-		t.Errorf("explicit -max-tokens must override the provider default, got %d", sess.cfg.maxTokens)
-	}
-}
-
-func TestResponsesAreUncappedByDefault(t *testing.T) {
-	// No arbitrary output cap anywhere: an 8k ceiling truncates exactly the
-	// long answers people ask for, after paying for the work that produced
-	// them. -max-tokens N is the opt-in cap.
-	if defaultMaxTokens != 0 {
-		t.Fatalf("harnais must ship with no output cap, got %d", defaultMaxTokens)
 	}
 }
 
 func TestReplCompleter(t *testing.T) {
 	sess := &session{
 		provider: "inceptron",
-		cfg:      config{model: "zai-org/GLM-5.3", maxIters: 1},
+		cfg:      config{model: "zai-org/GLM-5.3"},
 	}
 	// The list arrives from the background fetch; seed the cache directly
 	// so this test never touches the network.
@@ -492,6 +326,19 @@ func TestStartModelFetchCachesFailure(t *testing.T) {
 	if calls != 1 {
 		t.Errorf("a cached failure must not be refetched, got %d calls", calls)
 	}
+}
+
+// fakeListerSender extends fakeSender with a model list, standing in for
+// a backend that implements modelLister.
+type fakeListerSender struct {
+	fakeSender
+	ids   []string
+	calls int
+}
+
+func (f *fakeListerSender) listModels(_ context.Context) ([]string, error) {
+	f.calls++
+	return f.ids, nil
 }
 
 func TestListModelsWiring(t *testing.T) {

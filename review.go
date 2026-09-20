@@ -74,11 +74,10 @@ func reviewToolCall(ctx context.Context, sender messageSender, cfg config, histo
 		reviewGoal(history), tool, inputJSON, renderTranscript(history))
 	spin := startSpinner("reviewing")
 	resp, err := sender.createMessage(ctx, messageRequest{
-		Model:     cfg.model,
-		MaxTokens: cfg.maxTokens,
-		System:    reviewerSystemPrompt(),
-		Messages:  []message{textMessage("user", user)},
-		Effort:    cfg.effort,
+		Model:    cfg.model,
+		System:   reviewerSystemPrompt(),
+		Messages: []message{textMessage("user", user)},
+		Effort:   cfg.effort,
 	})
 	spin.finish()
 	if err != nil {
