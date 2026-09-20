@@ -6,9 +6,10 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"unicode/utf8"
 )
 
-// Line editing with TAB completion for the interactive REPL. The Go
+// Line editing with live completion for the interactive REPL. The Go
 // standard library does not expose termios, so the editor shells out to
 // stty(1) — present on every Unix harnais targets — to switch stdin to
 // raw mode, and only ever when both stdin and stderr are terminals (the
@@ -17,11 +18,33 @@ import (
 // cooked-mode rendering. The byte-dispatch core (readLineRaw) is pure
 // I/O and unit-tested without a terminal.
 
-// readLineEdited reads one line from the terminal with editing and TAB
+// completion is one candidate the editor offers: Value is what Enter
+// inserts for the highlighted row, Label is what the live list under the
+// prompt shows (usually Value plus an annotation, such as the backend a
+// model id belongs to).
+type completion struct {
+	Value string
+	Label string
+}
+
+// completer returns the candidates for the line typed so far: nil when the
+// line cannot be completed (a plain prompt) or nothing matches.
+type completer func(line string) []completion
+
+// maxSuggestions caps the live list so it stays short enough to keep the
+// prompt on screen without the terminal scrolling it away.
+const maxSuggestions = 8
+
+// completionHint is the dim footer the list carries while it is on screen:
+// walking the highlight with the arrows and taking a row with Enter is
+// obvious if you have used a search box and invisible if you have not.
+const completionHint = "↓/↑ to move · Enter to select"
+
+// readLineEdited reads one line from the terminal with editing and live
 // completion. exit=true means the user asked to leave (^C or ^D on an
 // empty line, or EOF). On any stty failure it degrades to a plain read:
 // losing the editor must not lose the session.
-func readLineEdited(prompt string, complete func(string) []string) (string, bool) {
+func readLineEdited(prompt string, complete completer) (string, bool) {
 	saved, err := stty("-g")
 	if err != nil {
 		return readLinePlain(), false
@@ -66,125 +89,251 @@ func stty(args ...string) (string, error) {
 	return out.String(), nil
 }
 
+// lineEditor is the raw-mode editing state. Every change to the line
+// repaints the prompt plus the candidates that match it, so completion
+// needs no TAB: matches appear as the words are typed, search-box style,
+// the arrow keys move a highlight down and up the list, and Enter takes
+// the highlighted row — or submits the line as typed.
+type lineEditor struct {
+	out      io.Writer
+	prompt   string
+	complete completer
+	line     []byte
+	sel      int // highlighted candidate; -1 means none
+}
+
 // readLineRaw is the editor core: it echoes to out, edits the line on
 // backspace (^H, DEL), ^U (clear), ^W (delete word), submits on CR/LF,
-// exits on ^C or ^D on an empty line (EOF included), ignores other
-// control bytes and escape sequences (arrow keys), and completes on TAB:
-// one match inserts it with a trailing space, several extend to the
-// longest common prefix, and a TAB that extends nothing lists them.
-func readLineRaw(in io.Reader, out io.Writer, prompt string, complete func(string) []string) (string, bool) {
-	var line []byte
-	redraw := func() {
-		fmt.Fprintf(out, "\r\033[K%s%s", prompt, line)
-	}
-	fmt.Fprint(out, prompt)
-	tabStuck := false // last TAB made no progress → the next one lists
-	esc := 0          // escape-sequence state: 0 none, 1 after ESC, 2 inside ESC [
+// exits on ^C or ^D on an empty line (EOF included), moves the completion
+// highlight on the arrow keys, ignores every other control byte and escape
+// sequence, and keeps the list under the prompt up to date.
+func readLineRaw(in io.Reader, out io.Writer, prompt string, complete completer) (string, bool) {
+	e := &lineEditor{out: out, prompt: prompt, complete: complete, sel: -1}
+	e.draw()
+	esc := 0 // escape-sequence state: 0 none, 1 after ESC, 2 inside ESC [
 	buf := make([]byte, 256)
 	for {
 		n, err := in.Read(buf)
 		for i := 0; i < n; i++ {
 			b := buf[i]
 			if esc > 0 {
-				// Consume CSI/SS3 sequences (arrow keys and friends)
-				// one final byte at a time; editing has no cursor
-				// movement, so they are ignored, never echoed.
+				// CSI/SS3 sequences: the arrows walk the completion
+				// highlight, everything else (home, end, delete, …) is
+				// swallowed, never echoed — the line has no cursor
+				// movement to apply them to.
 				if esc == 1 {
 					esc = 0
 					if b == '[' || b == 'O' {
 						esc = 2
 					}
-				} else if b >= 0x40 && b <= 0x7e {
+					continue
+				}
+				if b >= 0x40 && b <= 0x7e {
 					esc = 0
+					switch b {
+					case 'A': // up
+						e.moveSelection(-1)
+						e.draw()
+					case 'B': // down
+						e.moveSelection(1)
+						e.draw()
+					}
 				}
 				continue
 			}
 			switch {
 			case b == '\r' || b == '\n':
-				fmt.Fprint(out, "\r\n")
-				return string(line), false
-			case b == '\t' && complete != nil:
-				edited, stuck := tabEdit(string(line), tabStuck, complete, out)
-				line, tabStuck = []byte(edited), stuck
-				redraw()
+				// Enter picks the highlighted suggestion the way a
+				// search box does, then submits the line.
+				if e.applySelection() {
+					e.draw()
+				}
+				e.finishLine()
+				return string(e.line), false
+			case b == '\t':
+				// TAB is deliberately not a completion key: the list
+				// below the prompt is driven by typing and the arrows.
 			case b == 0x7f || b == 0x08:
-				if len(line) > 0 {
-					line = line[:len(line)-runeTailLen(line)]
-					redraw()
+				if len(e.line) > 0 {
+					e.line = e.line[:len(e.line)-runeTailLen(e.line)]
+					e.sel = -1
+					e.draw()
 				}
 			case b == 0x03: // ^C: clear the line, or leave on empty
+				e.clear()
 				fmt.Fprint(out, "^C\r\n")
-				if len(line) == 0 {
+				if len(e.line) == 0 {
 					return "", true
 				}
-				line = line[:0]
-				redraw()
+				e.line = e.line[:0]
+				e.sel = -1
+				e.draw()
 			case b == 0x04: // ^D: leave on an empty line
-				if len(line) == 0 {
+				if len(e.line) == 0 {
+					e.clear()
 					fmt.Fprint(out, "\r\n")
 					return "", true
 				}
 			case b == 0x15: // ^U: clear the line
-				line = line[:0]
-				redraw()
+				e.line = e.line[:0]
+				e.sel = -1
+				e.draw()
 			case b == 0x17: // ^W: delete the trailing word
-				line = trimLastWord(line)
-				redraw()
+				e.line = trimLastWord(e.line)
+				e.sel = -1
+				e.draw()
 			case b == 0x1b:
 				esc = 1
 			case b < 0x20:
 				// Other control bytes: ignored.
 			default:
-				line = append(line, b)
-				redraw()
+				e.line = append(e.line, b)
+				e.sel = -1
+				e.draw()
 			}
 		}
 		if err != nil {
+			e.clear()
 			return "", true
 		}
 	}
 }
 
-// tabEdit applies one TAB press to the line, printing the candidate
-// listing itself when a stuck TAB asks for it.
-func tabEdit(line string, tabStuck bool, complete func(string) []string, out io.Writer) (string, bool) {
-	cands := complete(line)
+// draw repaints the prompt line and the matches under it, and parks the
+// cursor at the end of the typed line so the next keystroke lands where the
+// user is typing and the candidates stay visible below.
+//
+// Everything is erased downwards from the cursor, never by stepping the
+// cursor up: the transcript above the prompt is the user's, and a cursor
+// that walks over it takes the history with it.
+func (e *lineEditor) draw() {
+	rows := suggestionRows(e.candidates())
+	if e.sel >= len(rows) {
+		e.sel = -1
+	}
+	// Home + erase-down drops the prompt line's old text and the block
+	// from the previous keystroke; both are redrawn below.
+	fmt.Fprint(e.out, "\r\033[J")
+	fmt.Fprint(e.out, e.prompt, string(e.line))
+	for i, row := range rows {
+		if i == e.sel {
+			row = colorize(ansiReverse, row)
+		}
+		fmt.Fprintf(e.out, "\r\n\033[K%s", row)
+	}
+	if len(rows) > 0 {
+		fmt.Fprintf(e.out, "\033[%dA\r", len(rows))
+		if col := promptColumns(e.prompt) + utf8.RuneCount(e.line); col > 0 {
+			fmt.Fprintf(e.out, "\033[%dC", col)
+		}
+	}
+}
+
+// clear drops the suggestion block. The cursor sits at the end of the typed
+// line, so erasing from here can only reach the block underneath it.
+func (e *lineEditor) clear() {
+	fmt.Fprint(e.out, "\033[J")
+}
+
+// finishLine clears the suggestions and steps below the submitted line.
+func (e *lineEditor) finishLine() {
+	e.clear()
+	fmt.Fprint(e.out, "\r\n")
+}
+
+// candidates asks the completer about the line as it stands.
+func (e *lineEditor) candidates() []completion {
+	if e.complete == nil {
+		return nil
+	}
+	return e.complete(string(e.line))
+}
+
+// suggestionRows renders the matches, a count of the ones that did not fit,
+// and the hint line. Only the matches are selectable.
+func suggestionRows(cands []completion) []string {
 	if len(cands) == 0 {
-		return line, false
+		return nil
 	}
-	if len(cands) == 1 {
-		word := lastWord(line)
-		return line + cands[0][len(word):] + " ", false
+	rows := make([]string, 0, maxSuggestions+2)
+	for i, c := range cands {
+		if i == maxSuggestions {
+			rows = append(rows, paint(ansiDim, fmt.Sprintf("  … %d more", len(cands)-i)))
+			break
+		}
+		rows = append(rows, "  "+c.Label)
 	}
-	word := lastWord(line)
-	if lcp := longestCommonPrefix(cands); len(lcp) > len(word) {
-		return line + lcp[len(word):], false
+	return append(rows, paint(ansiDim, "  "+completionHint))
+}
+
+// moveSelection walks the highlight down (delta 1) or up (-1) the visible
+// matches, wrapping at both ends like a search box. Nothing highlighted
+// yet: down takes the first row, up takes the last.
+func (e *lineEditor) moveSelection(delta int) {
+	selectable := e.selectable()
+	if selectable == 0 {
+		e.sel = -1
+		return
 	}
-	if tabStuck {
-		// A second stuck TAB lists the candidates, readline-style; the
-		// caller redraws the prompt line afterwards.
-		fmt.Fprintf(out, "\r\n%s\r\n", strings.Join(cands, "  "))
+	if e.sel < 0 {
+		if delta > 0 {
+			e.sel = 0
+			return
+		}
+		e.sel = selectable - 1
+		return
 	}
-	return line, true
+	e.sel = (e.sel + delta + selectable) % selectable
+}
+
+// applySelection replaces the word being typed with the highlighted
+// candidate, reporting whether there was one.
+func (e *lineEditor) applySelection() bool {
+	cands := e.candidates()
+	if e.sel < 0 || e.sel >= len(cands) || e.sel >= maxSuggestions {
+		return false
+	}
+	word := lastWord(string(e.line))
+	e.line = []byte(string(e.line[:len(e.line)-len(word)]) + cands[e.sel].Value)
+	e.sel = -1
+	return true
+}
+
+// selectable is how many of the matches the arrows can reach.
+func (e *lineEditor) selectable() int {
+	cands := e.candidates()
+	if len(cands) > maxSuggestions {
+		return maxSuggestions
+	}
+	return len(cands)
+}
+
+// promptColumns is the printed width of a prompt: ANSI colors take no
+// space, so they must not count toward the cursor column.
+func promptColumns(s string) int {
+	width := 0
+	for i := 0; i < len(s); {
+		if s[i] == 0x1b {
+			i++
+			if i < len(s) && s[i] == '[' {
+				i++
+				for i < len(s) && (s[i] < 0x40 || s[i] > 0x7e) {
+					i++
+				}
+				i++ // the sequence's final byte
+			}
+			continue
+		}
+		_, size := utf8.DecodeRuneInString(s[i:])
+		i += size
+		width++
+	}
+	return width
 }
 
 // lastWord is the text after the final space of the line.
 func lastWord(line string) string {
 	return line[strings.LastIndexByte(line, ' ')+1:]
-}
-
-// longestCommonPrefix is the shared start of all candidates.
-func longestCommonPrefix(cands []string) string {
-	if len(cands) == 0 {
-		return ""
-	}
-	prefix := cands[0]
-	for _, c := range cands[1:] {
-		for !strings.HasPrefix(c, prefix) {
-			prefix = prefix[:len(prefix)-1]
-		}
-	}
-	return prefix
 }
 
 // trimLastWord drops trailing spaces and the word before them (^W).

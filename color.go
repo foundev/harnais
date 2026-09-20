@@ -19,6 +19,7 @@ const (
 	ansiCyan     = "36"
 	ansiBold     = "1"
 	ansiDim      = "2"
+	ansiReverse  = "7"
 	ansiBoldCyan = "1;36"
 )
 

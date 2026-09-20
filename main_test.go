@@ -280,50 +280,15 @@ func (f *fakeListerSender) listModels(_ context.Context) ([]string, error) {
 	return f.ids, nil
 }
 
-func TestSlashModelsCommand(t *testing.T) {
-	sess := &session{
-		sender:   &fakeListerSender{ids: []string{"zai-org/GLM-5.3", "zai-org/GLM-5.2"}},
-		provider: "inceptron",
-		cfg:      config{model: "zai-org/GLM-5.3", maxIters: 1},
-	}
-	report, got := slashReporter()
-	handleSlash(sess, "/models", report)
-	joined := strings.Join(*got, "\n")
-	if !strings.Contains(joined, "zai-org/GLM-5.2") || !strings.Contains(joined, "zai-org/GLM-5.3") {
-		t.Errorf("/models must list ids: %q", joined)
-	}
-	// The fetch caches: a second /models does not refetch.
-	handleSlash(sess, "/models", report)
-	if sess.sender.(*fakeListerSender).calls != 1 {
-		t.Errorf("model list must be fetched once, got %d calls", sess.sender.(*fakeListerSender).calls)
-	}
-
-	// A backend without a list endpoint reports instead of hanging.
-	sess = &session{sender: &fakeSender{}, provider: "codex", cfg: config{model: "m"}}
-	report, got = slashReporter()
-	handleSlash(sess, "/models", report)
-	if !strings.Contains(lastReport(t, got), "unavailable") {
-		t.Errorf("missing list endpoint must report: %q", lastReport(t, got))
-	}
-
-	// No credential yet: same report path, no panic.
-	sess = &session{provider: "anthropic", cfg: config{model: "m"}}
-	report, got = slashReporter()
-	handleSlash(sess, "/models", report)
-	if !strings.Contains(lastReport(t, got), "unavailable") {
-		t.Errorf("missing credential must report: %q", lastReport(t, got))
-	}
-}
-
 func TestProviderSwitchInvalidatesModelCache(t *testing.T) {
 	t.Setenv("OPENROUTER_API_KEY", "ok")
 	t.Setenv("ANTHROPIC_API_KEY", "ak")
 	sess := newSlashSession(t)
-	sess.modelIDs, sess.modelsLoaded = []string{"stale"}, true
+	sess.cacheModels(sess.modelsGen, sess.provider, []string{"stale"})
 	report, _ := slashReporter()
 	handleSlash(sess, "/provider openrouter", report)
-	if sess.modelsLoaded || sess.modelIDs != nil {
-		t.Errorf("switch must drop the model cache: loaded=%v ids=%v", sess.modelsLoaded, sess.modelIDs)
+	if ids := modelSnapshot(sess); ids != nil {
+		t.Errorf("switch must drop the model cache: %v", ids)
 	}
 	// Switching also re-resolves the per-provider max-tokens default.
 	sess.maxTokensFlag = 0
@@ -356,35 +321,167 @@ func TestDefaultMaxTokens(t *testing.T) {
 
 func TestReplCompleter(t *testing.T) {
 	sess := &session{
-		sender:   &fakeListerSender{ids: []string{"zai-org/GLM-5.2", "zai-org/GLM-5.3", "moonshotai/Kimi-K2.6"}},
 		provider: "inceptron",
 		cfg:      config{model: "zai-org/GLM-5.3", maxIters: 1},
 	}
+	// The list arrives from the background fetch; seed the cache directly
+	// so this test never touches the network.
+	sess.cacheModels(sess.modelsGen, sess.provider,
+		[]string{"zai-org/GLM-5.2", "zai-org/GLM-5.3", "moonshotai/Kimi-K2.6"})
 	complete := replCompleter(context.Background(), sess)
 
-	if got := complete("/mo"); len(got) != 2 || got[0] != "/model" || got[1] != "/models" {
+	if got := complete("/mo"); len(got) != 1 || got[0].Value != "/model" {
 		t.Errorf("command completion wrong: %v", got)
 	}
 	if got := complete("plain text"); got != nil {
 		t.Errorf("plain prompts must not complete: %v", got)
 	}
-	if got := complete("/provider inc"); len(got) != 1 || got[0] != "inceptron" {
+	if got := complete("/provider inc"); len(got) != 1 || got[0].Value != "inceptron" {
 		t.Errorf("provider completion wrong: %v", got)
 	}
-	if got := complete("/effort h"); len(got) != 1 || got[0] != "high" {
+	if got := complete("/effort h"); len(got) != 1 || got[0].Value != "high" {
 		t.Errorf("effort completion wrong: %v", got)
 	}
-	if got := complete("/model zai"); len(got) != 2 {
-		t.Errorf("model completion must use the backend list: %v", got)
+	// Every model in the list is offered the moment /model is typed, each
+	// labelled with the backend that serves it.
+	all := complete("/model ")
+	if len(all) != 3 {
+		t.Fatalf("typing /model must list the whole backend list: %v", all)
 	}
-	if got := complete("/model moonshotai/"); len(got) != 1 || got[0] != "moonshotai/Kimi-K2.6" {
-		t.Errorf("full-prefix model completion wrong: %v", got)
+	if all[0].Label != "zai-org/GLM-5.2  (inceptron)" {
+		t.Errorf("model rows must name the provider: %q", all[0].Label)
+	}
+	// Matching is a case-insensitive substring search, so a fragment in
+	// the middle of an id still finds it.
+	if got := complete("/model glm"); len(got) != 2 {
+		t.Errorf("model completion must match loosely: %v", got)
+	}
+	if got := complete("/model moonshotai/"); len(got) != 1 || got[0].Value != "moonshotai/Kimi-K2.6" {
+		t.Errorf("full-id model completion wrong: %v", got)
 	}
 	if got := complete("/model nope"); got != nil {
 		t.Errorf("no matches must complete nothing: %v", got)
 	}
-	// The completion fetch populated the cache; further calls reuse it.
-	if sess.sender.(*fakeListerSender).calls != 1 {
-		t.Errorf("completions must share the /models cache, got %d calls", sess.sender.(*fakeListerSender).calls)
+}
+
+// waitForModelFetch waits for the background prefetch to land.
+func waitForModelFetch(t *testing.T, sess *session) {
+	t.Helper()
+	for i := 0; i < 400; i++ {
+		sess.modelsMu.Lock()
+		done := sess.modelsDone
+		sess.modelsMu.Unlock()
+		if done {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("model list was never fetched")
+}
+
+func TestStartModelFetchFillsCompletionCache(t *testing.T) {
+	var asked []string
+	sess := &session{
+		provider: "anthropic",
+		cfg:      config{model: "m"},
+		modelFetch: func(_ context.Context, provider, keyFlag string) ([]string, error) {
+			asked = append(asked, provider)
+			// The backend's own list order is what it is; each backend
+			// sorts before returning.
+			return []string{"claude-opus-4-1", "claude-sonnet-4-20250514"}, nil
+		},
+	}
+	startModelFetch(context.Background(), sess)
+	waitForModelFetch(t, sess)
+
+	ids := modelSnapshot(sess)
+	if len(ids) != 2 || ids[0] != "claude-opus-4-1" || ids[1] != "claude-sonnet-4-20250514" {
+		t.Fatalf("prefetch must cache the whole sorted list: %v", ids)
+	}
+	if len(asked) != 1 || asked[0] != "anthropic" {
+		t.Errorf("prefetch must ask the session's backend: %v", asked)
+	}
+	// Completion then reads the cache only: no TAB, no network.
+	rows := replCompleter(context.Background(), sess)("/model claude-")
+	if len(rows) != 2 {
+		t.Fatalf("typing must offer the cached models: %+v", rows)
+	}
+	if rows[0].Label != "claude-opus-4-1  (anthropic)" {
+		t.Errorf("model rows must name the provider: %q", rows[0].Label)
+	}
+	if rows[1].Value != "claude-sonnet-4-20250514" {
+		t.Errorf("row value must be the bare model id: %+v", rows[1])
+	}
+}
+
+func TestStartModelFetchCachesFailure(t *testing.T) {
+	calls := 0
+	sess := &session{
+		provider: "anthropic",
+		cfg:      config{model: "m"},
+		modelFetch: func(context.Context, string, string) ([]string, error) {
+			calls++
+			return nil, fmt.Errorf("missing API key")
+		},
+	}
+	startModelFetch(context.Background(), sess)
+	waitForModelFetch(t, sess)
+
+	if ids := modelSnapshot(sess); ids != nil {
+		t.Fatalf("a failed fetch must leave no models, got %v", ids)
+	}
+	// The cached failure keeps a keystroke from re-asking a dead backend.
+	startModelFetch(context.Background(), sess)
+	sess.modelsMu.Lock()
+	inflight := sess.modelsInflight
+	sess.modelsMu.Unlock()
+	if inflight {
+		t.Error("a cached failure must not be refetched by the prefetch")
+	}
+	// Typing on a /model line asks for the fetch again, but the cache is
+	// done, so the backend is never hit a second time.
+	replCompleter(context.Background(), sess)("/model ")
+	if calls != 1 {
+		t.Errorf("a cached failure must not be refetched, got %d calls", calls)
+	}
+}
+
+func TestListModelsWiring(t *testing.T) {
+	sender := &fakeListerSender{ids: []string{"zai-org/GLM-5.3"}}
+	ids, err := listModels(context.Background(), sender, "inceptron")
+	if err != nil || len(ids) != 1 || ids[0] != "zai-org/GLM-5.3" {
+		t.Fatalf("a backend with a list endpoint must report it: %v %v", ids, err)
+	}
+	if _, err := listModels(context.Background(), &fakeSender{}, "codex"); err == nil {
+		t.Error("a backend without a list endpoint must report that")
+	}
+}
+
+func TestProviderSwitchRetiresInflightFetch(t *testing.T) {
+	stale := make(chan struct{})
+	sess := &session{
+		provider: "anthropic",
+		cfg:      config{model: "m"},
+		modelFetch: func(context.Context, string, string) ([]string, error) {
+			<-stale
+			return []string{"stale-model"}, nil
+		},
+	}
+	startModelFetch(context.Background(), sess)
+	// Switch backends while the old fetch is still in flight: its list
+	// must never be served for the new provider.
+	sess.setProvider("openrouter")
+	close(stale)
+	for i := 0; i < 400; i++ {
+		sess.modelsMu.Lock()
+		inflight := sess.modelsInflight
+		sess.modelsMu.Unlock()
+		if !inflight {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if ids := modelSnapshot(sess); ids != nil {
+		t.Errorf("a fetch from the previous provider must not land: %v", ids)
 	}
 }

@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -58,7 +59,7 @@ Environment:
   CODEX_HOME           Directory holding Codex auth.json (default ~/.codex).
   CODEX_BASE_URL       Codex backend root (default %s).
 
-In a session, type /help for slash commands (/provider, /model, /models, /effort, /reset, /exit).
+In a session, type /help for slash commands (/provider, /model, /effort, /reset, /exit).
 `, defaultBaseURL, defaultOpenRouterBaseURL, defaultDeepSeekBaseURL, defaultOpenAIBaseURL, defaultInceptronBaseURL, defaultCodexBaseURL)
 	}
 	if err := fs.Parse(args); err != nil {
@@ -250,12 +251,20 @@ type session struct {
 	// maxTokensFlag is the raw startup -max-tokens (0 = provider
 	// default), kept so /provider can re-resolve the cap per backend.
 	maxTokensFlag int
-	// modelIDs caches the backend's model list for /models and TAB
-	// completion; modelsLoaded marks a completed fetch (possibly empty).
-	modelIDs     []string
-	modelsLoaded bool
 	// configPath persists /provider switches; "" disables persistence.
 	configPath string
+	// The model list feeds the editor's live completion.
+	// modelsMu guards the cache shared with the background prefetch;
+	// modelsGen is bumped by /provider so a fetch for the old backend
+	// cannot land after the switch.
+	modelsMu       sync.Mutex
+	modelsGen      uint64
+	modelIDs       []string
+	modelsDone     bool
+	modelsInflight bool
+	// modelFetch lists a backend's models (nil means fetchModelIDs);
+	// tests replace it to stay off the network.
+	modelFetch func(ctx context.Context, provider, keyFlag string) ([]string, error)
 }
 
 // ensureSender builds the session backend on first use.
@@ -314,8 +323,7 @@ func handleSlash(sess *session, line string, report progressFunc) (handled, exit
 	case "/help":
 		report(`Prompts go straight to the model. Commands:
   /provider [name]   show or switch backend (anthropic, openrouter, deepseek, openai, inceptron, codex); switching saves provider and model as the default for next launch and keeps history
-  /model [id]        show or set the model id (saved as default; TAB completes from the backend's list)
-  /models            list the backend's available model ids
+  /model [id]        show or set the model id (saved as default)
   /effort [level]    show or set reasoning effort: low, medium, high, default (saved as default; sent to all backends)
   /reset             clear conversation history
   /exit              leave`)
@@ -330,12 +338,11 @@ func handleSlash(sess *session, line string, report progressFunc) (handled, exit
 			break
 		}
 		sess.sender = sender
-		sess.provider = fields[1]
+		// The new backend has its own model list; drop the cache. The
+		// editor warms it again as soon as the next line is typed.
+		sess.setProvider(fields[1])
 		sess.cfg.model = model
 		sess.cfg.maxTokens = firstNonZero(sess.maxTokensFlag, defaultMaxTokens(sess.provider))
-		sess.keyFlag = ""
-		// The new backend has its own model list; drop the cache.
-		sess.modelIDs, sess.modelsLoaded = nil, false
 		persistSession(sess, report, fmt.Sprintf("provider: %s, model reset to %s (history kept)", sess.provider, model))
 	case "/model":
 		if len(fields) < 2 {
@@ -344,24 +351,6 @@ func handleSlash(sess *session, line string, report progressFunc) (handled, exit
 		}
 		sess.cfg.model = fields[1]
 		persistSession(sess, report, fmt.Sprintf("model: %s", sess.cfg.model))
-	case "/models":
-		// handleSlash has no caller context; a short private one keeps a
-		// dead backend from hanging the REPL on this command.
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		ids, err := availableModelIDs(ctx, sess)
-		if err != nil {
-			report("%s", paint(ansiYellow, fmt.Sprintf("model list unavailable: %v", err)))
-			break
-		}
-		if len(ids) == 0 {
-			report("%s", paint(ansiYellow, "the backend returned no models"))
-			break
-		}
-		report("available models (%d):", len(ids))
-		for _, id := range ids {
-			report("  %s", id)
-		}
 	case "/effort":
 		if len(fields) < 2 {
 			report("effort: %s (sent to all backends)", describeEffort(sess))
@@ -416,72 +405,173 @@ func defaultMaxTokens(provider string) int {
 	return 8192
 }
 
-// availableModelIDs lists the backend's model IDs for /models and TAB
-// completion, fetching once per provider and caching on the session. A
-// failed fetch stays uncached so the next attempt can retry; a backend
-// without a list endpoint caches as empty so it is not re-asked.
-func availableModelIDs(ctx context.Context, sess *session) ([]string, error) {
-	if sess.modelsLoaded {
-		return sess.modelIDs, nil
+// modelListTimeout bounds a background model-list fetch so a dead backend
+// cannot leave the cache permanently cold.
+const modelListTimeout = 20 * time.Second
+
+// setProvider records a /provider switch and retires the cached model
+// list; the next prefetch repopulates it for the new backend.
+func (sess *session) setProvider(provider string) {
+	sess.modelsMu.Lock()
+	defer sess.modelsMu.Unlock()
+	sess.provider = provider
+	sess.keyFlag = ""
+	sess.modelsGen++
+	sess.modelIDs, sess.modelsDone = nil, false
+}
+
+// modelSnapshot returns the cached model list without touching the
+// network: the editor asks for it on every keystroke and must never wait.
+func modelSnapshot(sess *session) []string {
+	sess.modelsMu.Lock()
+	defer sess.modelsMu.Unlock()
+	if !sess.modelsDone {
+		return nil
 	}
-	if err := ensureSender(sess); err != nil {
-		return nil, err
+	return sess.modelIDs
+}
+
+// cacheModels stores a fetched list, unless /provider moved to another
+// backend while the fetch was in flight. A failed or empty fetch caches
+// as an empty list so the next keystroke does not ask again.
+func (sess *session) cacheModels(gen uint64, provider string, ids []string) {
+	sess.modelsMu.Lock()
+	defer sess.modelsMu.Unlock()
+	sess.cacheModelsLocked(gen, provider, ids)
+}
+
+func (sess *session) cacheModelsLocked(gen uint64, provider string, ids []string) {
+	if gen != sess.modelsGen || provider != sess.provider {
+		return
 	}
-	lister, ok := sess.sender.(modelLister)
-	if !ok {
-		sess.modelIDs, sess.modelsLoaded = nil, true
-		return nil, fmt.Errorf("the %s backend has no model list endpoint", sess.provider)
+	sess.modelIDs, sess.modelsDone = ids, true
+}
+
+// startModelFetch warms the model cache in the background, once per
+// backend. Failures are cached too: the editor asks on every keystroke, so
+// a backend without a list endpoint (or without a credential) must not
+// turn typing into a burst of failing requests.
+func startModelFetch(ctx context.Context, sess *session) {
+	sess.modelsMu.Lock()
+	if sess.modelsDone || sess.modelsInflight {
+		sess.modelsMu.Unlock()
+		return
 	}
-	ids, err := lister.listModels(ctx)
+	sess.modelsInflight = true
+	provider, keyFlag, gen := sess.provider, sess.keyFlag, sess.modelsGen
+	fetch := sess.fetcher()
+	sess.modelsMu.Unlock()
+
+	go func() {
+		ids, err := fetch(ctx, provider, keyFlag)
+		if err != nil {
+			ids = nil
+		}
+		// Clear the in-flight flag and commit in one step, so the next
+		// keystroke never sees an idle cache that is about to fill.
+		sess.modelsMu.Lock()
+		defer sess.modelsMu.Unlock()
+		sess.modelsInflight = false
+		sess.cacheModelsLocked(gen, provider, ids)
+	}()
+}
+
+// fetcher is how the session lists a backend's models. Tests replace
+// modelFetch so no test needs a live backend.
+func (sess *session) fetcher() func(ctx context.Context, provider, keyFlag string) ([]string, error) {
+	if sess.modelFetch != nil {
+		return sess.modelFetch
+	}
+	return fetchModelIDs
+}
+
+// fetchModelIDs builds the backend from the given credential and asks it
+// for its model list. It touches no session state, so a prefetch can run
+// while the REPL keeps editing.
+func fetchModelIDs(ctx context.Context, provider, keyFlag string) ([]string, error) {
+	sender, err := buildSender(provider, keyFlag)
 	if err != nil {
 		return nil, err
 	}
-	sess.modelIDs, sess.modelsLoaded = ids, true
-	return ids, nil
+	fctx, cancel := context.WithTimeout(ctx, modelListTimeout)
+	defer cancel()
+	return listModels(fctx, sender, provider)
 }
 
-// slashCommands, providerNames, and effortLevels feed TAB completion.
+// listModels asks an already-built backend for its model list.
+func listModels(ctx context.Context, sender messageSender, provider string) ([]string, error) {
+	lister, ok := sender.(modelLister)
+	if !ok {
+		return nil, fmt.Errorf("the %s backend has no model list endpoint", provider)
+	}
+	return lister.listModels(ctx)
+}
+
+// slashCommands, providerNames, and effortLevels feed live completion.
 var (
-	slashCommands = []string{"/effort", "/exit", "/help", "/model", "/models", "/provider", "/quit", "/reset"}
+	slashCommands = []string{"/effort", "/exit", "/help", "/model", "/provider", "/quit", "/reset"}
 	providerNames = []string{"anthropic", "codex", "deepseek", "inceptron", "openai", "openrouter"}
 	effortLevels  = []string{"default", "high", "low", "medium"}
 )
 
-// replCompleter serves TAB completion in the interactive editor: slash
+// replCompleter serves completion in the interactive editor: slash
 // commands on the first word, then per-command values — provider names,
-// effort levels, and the backend's live model IDs after /model.
-func replCompleter(ctx context.Context, sess *session) func(line string) []string {
-	return func(line string) []string {
+// effort levels, and the backend's whole model list after /model. The
+// editor calls this on every keystroke, so it only ever reads the cache;
+// the fetch happens in the background (see startModelFetch).
+func replCompleter(ctx context.Context, sess *session) completer {
+	return func(line string) []completion {
 		if !strings.HasPrefix(line, "/") {
 			return nil
 		}
 		if !strings.Contains(line, " ") {
-			return filterPrefix(slashCommands, line)
+			return prefixCompletions(slashCommands, line)
 		}
 		cmd, _, _ := strings.Cut(line, " ")
-		word := line[strings.LastIndexByte(line, ' ')+1:]
+		word := lastWord(line)
 		switch cmd {
 		case "/provider":
-			return filterPrefix(providerNames, word)
+			return prefixCompletions(providerNames, word)
 		case "/model":
-			ids, _ := availableModelIDs(ctx, sess)
-			return filterPrefix(ids, word)
+			startModelFetch(ctx, sess)
+			return modelCompletions(modelSnapshot(sess), word, sess.provider)
 		case "/effort":
-			return filterPrefix(effortLevels, word)
+			return prefixCompletions(effortLevels, word)
 		}
 		return nil
 	}
 }
 
-// filterPrefix keeps the candidates a word prefix matches, nil when none.
-func filterPrefix(cands []string, prefix string) []string {
-	var out []string
+// prefixCompletions offers the candidates the typed word starts.
+func prefixCompletions(cands []string, word string) []completion {
+	var out []completion
 	for _, c := range cands {
-		if strings.HasPrefix(c, prefix) {
-			out = append(out, c)
+		if strings.HasPrefix(c, word) {
+			out = append(out, completion{Value: c, Label: c})
 		}
 	}
 	return out
+}
+
+// modelCompletions matches model ids anywhere in the id and ignoring case
+// — typing "glm" must find "zai-org/GLM-5.3" — and shows every id with the
+// backend serving it.
+func modelCompletions(ids []string, word, provider string) []completion {
+	needle := strings.ToLower(word)
+	var out []completion
+	for _, id := range ids {
+		if !strings.Contains(strings.ToLower(id), needle) {
+			continue
+		}
+		out = append(out, completion{Value: id, Label: modelLabel(id, provider)})
+	}
+	return out
+}
+
+// modelLabel is a model id plus the backend it comes from, dimmed so the
+// id itself stays the thing being read.
+func modelLabel(id, provider string) string {
+	return id + "  " + paint(ansiDim, "("+provider+")")
 }
 
 // buildSender constructs the backend client, requiring its credential.
@@ -567,14 +657,17 @@ func firstNonZero(vals ...int) int {
 }
 
 func repl(ctx context.Context, sess *session, in *bufio.Reader, report progressFunc) int {
-	report("harnais %s — %s (type /help for commands)", version, paint(ansiCyan, sess.provider+"/"+sess.cfg.model))
-	// Line editing with TAB completion needs both ends on the terminal:
+	// Line editing with live completion needs both ends on the terminal:
 	// keystrokes from stdin, echo to stderr. Pipes and tests keep the
 	// plain bufio path.
 	interactive := isTerminal(os.Stdin) && isTerminal(os.Stderr)
-	var completeFn func(string) []string
+	report("harnais %s — %s (type /help for commands)", version, paint(ansiCyan, sess.provider+"/"+sess.cfg.model))
+	var completeFn completer
 	if interactive {
 		completeFn = replCompleter(ctx, sess)
+		// Warm the model list now so the first /model keystroke already
+		// has something to suggest.
+		startModelFetch(ctx, sess)
 	}
 	for {
 		var line string

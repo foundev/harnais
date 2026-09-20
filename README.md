@@ -101,17 +101,22 @@ Session commands:
 ```sh
 anthropic> /provider openrouter   # switch backend, saved as default (model resets, history kept)
 anthropic> /model my-model        # use a different model id, saved as default
-anthropic> /models                # list the backend's available model ids
 anthropic> /effort high           # reasoning effort (low, medium, high, default), saved as default
 anthropic> /reset                 # clear history
 anthropic> /exit                  # leave
 ```
 
 On a terminal the session reads lines with basic editing (backspace,
-^U, ^W) and TAB completion: slash commands on `/`, provider names after
-`/provider `, effort levels after `/effort `, and the backend's live
-model list after `/model ` (fetched from the backend's models endpoint
-and cached per provider; ^C clears the line or leaves on an empty one).
+^U, ^W) and live completion: the matches appear under the prompt as you
+type, search-box style — slash commands on `/`, provider names after
+`/provider `, effort levels after `/effort `, and the backend's whole
+model list after `/model `, each id shown with the backend that serves
+it. The list is fetched once per backend in the background (after a
+`/provider` switch, as soon as the next line is typed) and cached, so
+typing never waits on the network. The arrow keys move a highlight down
+and up the list and Enter takes the highlighted row (or submits the line
+as typed when nothing is highlighted); ^C clears the line or leaves on
+an empty one.
 
 Provider, model, and effort persist in `$XDG_CONFIG_HOME/harnais/config.json`
 (`~/.config/harnais/config.json` by default), so the next launch —
@@ -160,7 +165,7 @@ for `-provider=deepseek`, `gpt-5-mini` for `-provider=openai`,
 | `CODEX_BASE_URL`     | Codex backend root (default `https://chatgpt.com/backend-api/codex`) |
 | `HARNAIS_DEBUG`      | When set to a file path, appends Codex request/response bodies there (never tokens) |
 
-In a session, `/help` lists the slash commands (`/provider`, `/model`, `/models`, `/effort`, `/reset`, `/exit`).
+In a session, `/help` lists the slash commands (`/provider`, `/model`, `/effort`, `/reset`, `/exit`).
 
 ## Review
 
@@ -214,7 +219,7 @@ unsandboxed with a one-time warning
 - `anthropic.go` — minimal Messages API client (`net/http` + `encoding/json`)
 - `openai.go` — OpenAI-compatible client (OpenRouter, DeepSeek, OpenAI, Inceptron) translated onto the same loop
 - `codex.go` — Codex subscription backend: reuses the Codex CLI login, speaks the Responses API
-- `edit.go` — raw-mode line editor with TAB completion for the interactive REPL
+- `edit.go` — raw-mode line editor with live (type-ahead) completion for the interactive REPL
 - `tools.go` — the four tool implementations
 - `tools_test.go` — tool tests (`go test ./...`)
 
