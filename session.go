@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -37,13 +38,25 @@ func sessionsDir() (string, error) {
 
 // newSessionPath names a fresh session file after its creation time in UTC.
 // The file is only written on the first save, so opening harnais and
-// quitting without a prompt leaves nothing behind.
+// quitting without a prompt leaves nothing behind. A /new session started
+// in the same second as the last one would collide on the timestamped
+// name, so taken names get a numeric suffix (-2, -3, …) instead of
+// silently overwriting.
 func newSessionPath() (string, error) {
 	dir, err := sessionsDir()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(dir, time.Now().UTC().Format("20060102-150405")+".json"), nil
+	base := filepath.Join(dir, time.Now().UTC().Format("20060102-150405")+".json")
+	path := base
+	for i := 2; ; i++ {
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			return path, nil
+		} else if err != nil {
+			return "", err
+		}
+		path = strings.TrimSuffix(base, ".json") + fmt.Sprintf("-%d.json", i)
+	}
 }
 
 // saveSession atomically writes the session's current state, so a crash

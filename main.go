@@ -58,7 +58,7 @@ Environment:
   CODEX_HOME           Directory holding Codex auth.json (default ~/.codex).
   CODEX_BASE_URL       Codex backend root (default %s).
 
-In a session, type /help for slash commands (/provider, /model, /effort, /reset, /exit).
+In a session, type /help for slash commands (/provider, /model, /effort, /reset, /new, /resume, /exit).
 
 Interactive sessions are saved as they run; start the most recent one with -resume.
 `, defaultBaseURL, defaultOpenRouterBaseURL, defaultDeepSeekBaseURL, defaultOpenAIBaseURL, defaultInceptronBaseURL, defaultCodexBaseURL)
@@ -327,6 +327,20 @@ func handleSlash(sess *session, line string, report progressFunc) (handled, exit
 	case "/reset":
 		sess.history = nil
 		report("conversation reset")
+	case "/new":
+		// Start a fresh conversation in this REPL, keeping the current
+		// provider, model, and effort. The conversation so far is saved
+		// first (under its own file), so /resume can always bring it
+		// back; the next turn gets a new timestamped session file.
+		if sess.history != nil && sess.savePath != "" {
+			if err := saveSession(sess); err != nil {
+				report("%s", paint(ansiYellow, fmt.Sprintf("could not save the current session before starting a new one: %v", err)))
+			}
+		}
+		sess.history = nil
+		sess.savePath = ""
+		sess.saved = false
+		report("%s", paint(ansiGreen, "new session — the previous one stays resumable with /resume or -resume"))
 	case "/resume":
 		// Load the most recent other session into this one. The live
 		// session is excluded so /resume never just reloads itself, and
@@ -351,6 +365,7 @@ func handleSlash(sess *session, line string, report progressFunc) (handled, exit
   /model [id]        show or set the model id (saved as default)
   /effort [level]    show or set reasoning effort: low, medium, high, default (saved as default; sent to all backends)
   /reset             clear conversation history
+  /new               start a fresh session (the current one is saved and stays resumable)
   /resume            load the most recent saved session (excluding this one) and replay its transcript
   /exit              leave
 
@@ -524,7 +539,7 @@ func listModels(ctx context.Context, sender messageSender, provider string) ([]s
 
 // slashCommands, providerNames, and effortLevels feed live completion.
 var (
-	slashCommands = []string{"/effort", "/exit", "/help", "/model", "/provider", "/quit", "/reset", "/resume"}
+	slashCommands = []string{"/effort", "/exit", "/help", "/model", "/new", "/provider", "/quit", "/reset", "/resume"}
 	providerNames = []string{"anthropic", "codex", "deepseek", "inceptron", "openai", "openrouter"}
 	effortLevels  = []string{"default", "high", "low", "medium"}
 )

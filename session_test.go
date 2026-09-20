@@ -231,6 +231,38 @@ func TestSlashResumeWithoutSavedSessions(t *testing.T) {
 	}
 }
 
+// TestNewSessionPathSuffixesCollisions checks that a second session born
+// in the same second gets its own file instead of clobbering the first.
+func TestNewSessionPathSuffixesCollisions(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", dir)
+	p1, err := newSessionPath()
+	if err != nil {
+		t.Fatalf("first path: %v", err)
+	}
+	// Pre-create both the plain name and the first suffix, so the "next"
+	// path must skip past them.
+	os.MkdirAll(filepath.Dir(p1), 0o755)
+	if err := os.WriteFile(p1, []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	suffixed := strings.TrimSuffix(p1, ".json") + "-2.json"
+	if err := os.WriteFile(suffixed, []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p3, err := newSessionPath()
+	if err != nil {
+		t.Fatalf("third path: %v", err)
+	}
+	if p3 != strings.TrimSuffix(p1, ".json")+"-3.json" {
+		t.Errorf("expected the -3 suffix after both names are taken, got %s", p3)
+	}
+	// Same second means the same base name; the suffix is what separates.
+	if p1 == p3 {
+		t.Error("colliding names must be distinguished")
+	}
+}
+
 // TestReplayTranscript checks the transcript matches the live progress
 // shape: prompts and answers in full, tool calls as "● name(input)" and
 // results as one indented line. Thinking blocks and empty content stay
@@ -298,6 +330,83 @@ func TestResumeReplaysTranscript(t *testing.T) {
 	}
 	if !strings.Contains(joined, "ship the fix") {
 		t.Errorf("replayed transcript must show the restored conversation: %v", *got)
+	}
+}
+
+// TestSlashNew checks that /new saves the live conversation under its own
+// file, hands the next turn a fresh session path, and keeps the backend
+// and effort — so the new session starts clean but on the same setup, and
+// the old one stays resumable.
+func TestSlashNew(t *testing.T) {
+	cfgDir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", cfgDir)
+	sender := &fakeSender{t: t}
+	sender.script = func(call int, req messageRequest) messageResponse {
+		return messageResponse{
+			ID:         fmt.Sprintf("msg_%d", call),
+			Content:    []contentBlock{{Type: "text", Text: "done."}},
+			StopReason: "end_turn",
+		}
+	}
+	sess := &session{sender: sender, provider: "openrouter", cfg: config{model: "openai/gpt-5-mini", effort: "low"}}
+	report, got := slashReporter()
+
+	// Turn one fills the live session; /new then archives it.
+	in := bufio.NewReader(strings.NewReader("first task\n/new\nsecond task\n/exit\n"))
+	if code := repl(context.Background(), sess, in, report); code != 0 {
+		t.Fatalf("repl exited %d", code)
+	}
+	joined := strings.Join(*got, "\n")
+	if !strings.Contains(joined, "new session") {
+		t.Errorf("/new must report the fresh start: %v", *got)
+	}
+	if sess.provider != "openrouter" || sess.cfg.model != "openai/gpt-5-mini" || sess.cfg.effort != "low" {
+		t.Errorf("backend must survive /new: %s %+v", sess.provider, sess.cfg)
+	}
+	// The pre-/new conversation is on disk somewhere.
+	sessDir := filepath.Join(cfgDir, "harnais", "sessions")
+	entries, err := os.ReadDir(sessDir)
+	if err != nil {
+		t.Fatalf("read sessions dir: %v", err)
+	}
+	var first, second string
+	for _, e := range entries {
+		raw, err := os.ReadFile(filepath.Join(sessDir, e.Name()))
+		if err != nil {
+			continue
+		}
+		switch {
+		case strings.Contains(string(raw), "first task"):
+			first = string(raw)
+		case strings.Contains(string(raw), "second task"):
+			second = string(raw)
+		}
+	}
+	if first == "" {
+		t.Errorf("the pre-/new conversation must be saved: %v", entries)
+	}
+	if second == "" {
+		t.Errorf("the post-/new turn must be saved too: %v", entries)
+	}
+	// The new session must live under a fresh path — the turn after /new
+	// auto-saves there (saved=true again), never into the archived file.
+	if sess.savePath == "" {
+		t.Fatal("after /new the session must have a fresh save path")
+	}
+	if raw, err := os.ReadFile(sess.savePath); err != nil || !strings.Contains(string(raw), "second task") {
+		t.Errorf("the fresh session file must hold the post-/new turn: %v %s", err, raw)
+	}
+	if first != "" && second != "" && strings.Contains(first, "second task") {
+		t.Error("the archived file must not hold post-/new turns")
+	}
+	// And the archived session is actually resumable via the normal path.
+	st, _, err := latestSession(sess.savePath)
+	if err != nil {
+		t.Fatalf("archived session not resumable: %v", err)
+	}
+	blob, _ := json.Marshal(st.History)
+	if !strings.Contains(string(blob), "first task") {
+		t.Errorf("resuming the archive must bring back the old conversation: %s", blob)
 	}
 }
 
