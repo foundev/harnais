@@ -27,6 +27,10 @@ jobs:
             windows/amd64; do
             GOOS="${target%%/*}"
             GOARCH="${target##*/}"
+            # env on the command line, not exported shell vars: only that
+            # reaches the go build child process, so each target actually
+            # cross-compiles instead of rebuilding the host platform.
+            env GOOS="$GOOS" GOARCH="$GOARCH" \
             go build -trimpath \
               -ldflags "-s -w -X main.version=${VERSION}" \
               -o "dist/harnais_${GOOS}_${GOARCH}" \
@@ -45,6 +49,31 @@ jobs:
               rm "$f"
             fi
           done
+
+      - name: Verify archives
+        # The cross-compile used to silently no-op and ship five copies
+        # of the host binary; check each archive holds a binary its name
+        # vouches for before anything reaches the release page.
+        run: |
+          failed=0
+          for a in dist/harnais_*.tar.gz dist/harnais_*.zip; do
+            name="$(basename "$a" | sed 's/\.tar\.gz$//; s/\.zip$//')"
+            os="${name#harnais_}"; os="${os%_*}"
+            want="ELF"
+            [[ "$os" == darwin* ]] && want="Mach-O"
+            [[ "$os" == windows* ]] && want="PE32+"
+            d="$(mktemp -d)"
+            case "$a" in
+              *.zip) unzip -q "$a" -d "$d" ;;
+              *) tar -xzf "$a" -C "$d" ;;
+            esac
+            got="$(file "$d"/harnais* | cut -d: -f2-)"
+            if [[ "$got" != *"$want"* ]]; then
+              echo "::error::$name holds a $got — expected $want"
+              failed=1
+            fi
+          done
+          exit "$failed"
 
       - name: Release
         uses: softprops/action-gh-release@v2
